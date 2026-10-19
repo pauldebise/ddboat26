@@ -17,21 +17,18 @@ Usage :
   python3 cap_sender_v3.py
 """
 from __future__ import print_function, division
-import sys, os, time
+import os
+import sys
+import time
 import numpy as np
 import socket
 
-# ── Chemin vers les drivers DD-Boat ─────────────────────────────────────────
-sys.path.append('/home/ue32/drivers-ddboat-v2')
-from imu9_driver_v2 import Imu9IO
+# ── Dossier de calibration (indépendant du répertoire courant) ──────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Arguments ────────────────────────────────────────────────────────────────
-if len(sys.argv) < 2:
-    print("Usage : python cap_sender.py <IP_du_PC> [port]")
-    sys.exit(1)
 
-PC_IP = sys.argv[1]
-PC_PORT = int(sys.argv[2]) if len(sys.argv) >= 3 else 5005
+def _calibration_path(filename):
+    return os.path.join(BASE_DIR, filename)
 
 
 # ── Fonctions d'algèbre linéaire alternatives à SciPy ────────────────────────
@@ -49,8 +46,8 @@ def my_sqrtm(M):
 # ── Chargement de la calibration ─────────────────────────────────────────────
 def load_calibration():
     try:
-        invA = np.loadtxt("invA.csv", delimiter=",")
-        xbar = np.loadtxt("xbar.csv", delimiter=",")
+        invA = np.loadtxt(_calibration_path("invA.csv"), delimiter=",")
+        xbar = np.loadtxt(_calibration_path("xbar.csv"), delimiter=",")
         print("[OK] Calibration chargee depuis invA.csv et xbar.csv")
         return invA, xbar
     except IOError:
@@ -60,8 +57,8 @@ def load_calibration():
 
 def compute_calibration():
     # Chargement des données brutes
-    x1, x2, x3 = np.loadtxt('donnees_mag.csv', delimiter=',', unpack=True)
-    data = np.loadtxt('magNorthWest.csv')
+    x1, x2, x3 = np.loadtxt(_calibration_path('donnees_mag.csv'), delimiter=',', unpack=True)
+    data = np.loadtxt(_calibration_path('magNorthWest.csv'))
     xnorth = data[:3].reshape(3, 1)
     xwest = data[3:].reshape(3, 1)
 
@@ -95,8 +92,8 @@ def compute_calibration():
     invA = R.dot(sqrtQ)
 
     # Sauvegarde
-    np.savetxt("invA.csv", invA, delimiter=",")
-    np.savetxt("xbar.csv", xbar.flatten(), delimiter=",")
+    np.savetxt(_calibration_path("invA.csv"), invA, delimiter=",")
+    np.savetxt(_calibration_path("xbar.csv"), xbar.flatten(), delimiter=",")
     print("[OK] Calibration calculee et sauvegardee.")
     return invA, xbar.flatten()
 
@@ -104,14 +101,27 @@ def compute_calibration():
 # ── Calcul du cap ─────────────────────────────────────────────────────────────
 def compute_heading(raw_mag, invA, xbar):
     x = np.array(raw_mag).reshape(3, 1)
-    xb = xbar.reshape(3, 1)
+    xb = np.asarray(xbar).reshape(3, 1)
     yhat = invA.dot(x - xb)
-    heading = np.arctan2(float(yhat[1]), float(yhat[0])) % (2 * np.pi)
+    heading = np.arctan2(float(yhat[1, 0]), float(yhat[0, 0])) % (2 * np.pi)
     return heading
 
 
 # ── Programme principal ───────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Arguments lus uniquement quand le script est exécuté directement,
+    # pour que compute_heading / load_calibration restent importables.
+    if len(sys.argv) < 2:
+        print("Usage : python cap_sender_v3.py <IP_du_PC> [port]")
+        sys.exit(1)
+
+    PC_IP = sys.argv[1]
+    PC_PORT = int(sys.argv[2]) if len(sys.argv) >= 3 else 5005
+
+    # ── Chemin vers les drivers DD-Boat ─────────────────────────────────────
+    sys.path.append('/home/ue32/drivers-ddboat-v2')
+    from imu9_driver_v2 import Imu9IO
+
     invA, xbar = load_calibration()
     imu = Imu9IO()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
