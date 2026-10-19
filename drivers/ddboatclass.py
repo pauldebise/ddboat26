@@ -29,7 +29,6 @@ def angle_diff(target, current):
 
 class DDBoat:
 
-    VITESSE_ROTATION = 60  # consigne moteur utilisée par tour_complet (0-255)
 
     def __init__(self, ard, gps, imu) -> None:
         self.ard: ArduinoIO = ard
@@ -40,9 +39,6 @@ class DDBoat:
 
     def calibration(self):
         """Lance les deux acquisitions puis charge/calcule la calibration."""
-        # cap_sender_v3.py n'est volontairement pas exécuté ici : c'est un
-        # programme de diffusion UDP qui tourne en boucle. Ses fonctions
-        # load_calibration / compute_heading sont importées plus haut.
         scripts = ["create_donnees_mag.py", "create_magNorthWest.py"]
 
         print("=== Début du processus de calibration du DDBoat ===")
@@ -80,37 +76,28 @@ class DDBoat:
         return np.degrees(self.current_cap_rad())
 
     def tour_complet(self):
-        cadrans = np.array([0.0, math.pi / 2, math.pi, -math.pi / 2])
-        tolerance = 0.1  # tolérance d'acceptation du cap (radians, ~6 degrés)
+        cadran_dir = ["DEVANT", "GAUCHE", "DERRIERE", "DROITE", "DEVANT"]
+        cadrans = np.array([0.0, math.pi / 2, math.pi, 3*math.pi / 2])
         cadrans += self.current_cap_rad()
 
-        for target in cadrans:
-            target %= 2 * math.pi
-            print(f"-> Rotation vers le cap cible : {target:.2f} rad")
+        for i in range(4):
 
             while True:
                 # 1. On récupère le cap actuel du bateau
                 current = self.current_cap_rad()
 
-                # 2. On calcule l'écart angulaire
-                erreur = angle_diff(target, current)
+                VITESSE_ROTATION = 60
 
-                # 3. Si on est assez proche du cap cible, on sort de la boucle
-                if abs(erreur) < tolerance:
-                    print(f"Cap {target:.2f} atteint avec succès !")
+                if current > cadrans[i]:
+                    print(f"Cadrant", cadran_dir[i], cadran_dir[i+1], "atteint avec succès !")
                     break
-
-                # 4. Commande des moteurs en tout-ou-rien pour tourner
-                # (inverser les signes si le bateau tourne dans le mauvais sens)
-                if erreur > 0:
-                    self.ard.send_arduino_cmd_motor(-self.VITESSE_ROTATION, self.VITESSE_ROTATION)
                 else:
-                    self.ard.send_arduino_cmd_motor(self.VITESSE_ROTATION, -self.VITESSE_ROTATION)
+                    self.ard.send_arduino_cmd_motor(-VITESSE_ROTATION, VITESSE_ROTATION)
 
                 # Petite pause pour ne pas saturer le processeur du Raspberry Pi
                 time.sleep(0.05)
 
-            self.ard.send_arduino_cmd_motor(0, 0)
 
             # Petite pause entre chaque quadrant si besoin de stabilisation
             time.sleep(0.5)
+        self.ard.send_arduino_cmd_motor(0, 0)
