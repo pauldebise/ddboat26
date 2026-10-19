@@ -26,6 +26,13 @@ DRIVERS_DIR = Path(__file__).resolve().parent
 def angle_diff(target, current):
     return math.atan2(math.sin(target - current), math.cos(target - current))
 
+def vector_to_heading_cartesian(x, y):
+  """Convertit un vecteur (x, y) en angle cartésien (radians).
+
+  0 = Axe X positif, pi/2 = Axe Y positif.
+  """
+  return math.atan2(y, x)
+
 
 class DDBoat:
 
@@ -214,6 +221,30 @@ class DDBoat:
             return x_rot, y_rot
 
         return dx, dy
+
+    def maintien_cap(self,target_dir):
+        """Calcule et applique la vitesse des moteurs pour maintenir le cap cible (target_heading)."""
+        Kp = 40
+        v_base = 150
+
+        current_cap = self.current_cap_rad()  # ou votre méthode de cap actuel
+        target_cap = vector_to_heading_cartesian(target_dir[0], target_dir[1])
+        error = angle_diff(target_cap, current_cap)
+
+        # Asservissement proportionnel simple
+        u = Kp * error
+
+        # Envoi de la commande aux moteurs gauche / droite
+
+        speed_left = v_base - u
+        speed_right = v_base + u
+        if speed_left > 191:
+            speed_left = 191
+        if speed_right > 191:
+            speed_right = 191
+
+        self.ard.set_motor_speeds(speed_left, speed_right)
+
 
 
 
