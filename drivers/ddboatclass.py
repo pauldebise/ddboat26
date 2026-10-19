@@ -31,9 +31,9 @@ class DDBoat:
 
 
     def __init__(self, ard, gps, imu) -> None:
-        self.ard: ArduinoIO = ard
-        self.gps: GpsIO = gps
-        self.imu: Imu9IO = imu
+        self.ard = ard
+        self.gps = gps
+        self.imu = imu
         self.invA = None
         self.xbar = None
 
@@ -44,7 +44,7 @@ class DDBoat:
         print("=== Début du processus de calibration du DDBoat ===")
 
         for script in scripts:
-            print(f"--> Exécution de {script}...")
+            print(script)
             try:
                 subprocess.run(
                     [sys.executable, str(DRIVERS_DIR / script)],
@@ -52,9 +52,11 @@ class DDBoat:
                     cwd=DRIVERS_DIR,
                 )
             except subprocess.CalledProcessError as e:
-                print(f"Une erreur est survenue lors de l'exécution de {script} : {e}")
+                print("Une erreur est survenue lors de l'exécution de ")
+                print(script)
                 return False
-            print(f"    {script} exécuté avec succès.")
+            print(script)
+            print("exécuté avec succès.")
 
         # Charge invA.csv / xbar.csv, ou les calcule depuis les CSV bruts.
         self.invA, self.xbar = load_calibration()
@@ -87,9 +89,9 @@ class DDBoat:
                 current = self.current_cap_rad()
 
                 VITESSE_ROTATION = 60
-
+                print(current)
                 if current > cadrans[i]:
-                    print(f"Cadrant", cadran_dir[i], cadran_dir[i+1], "atteint avec succès !")
+                    print("Cadrant", cadran_dir[i], cadran_dir[i+1], "atteint avec succès !")
                     break
                 else:
                     self.ard.send_arduino_cmd_motor(-VITESSE_ROTATION, VITESSE_ROTATION)
@@ -101,3 +103,16 @@ class DDBoat:
             # Petite pause entre chaque quadrant si besoin de stabilisation
             time.sleep(0.5)
         self.ard.send_arduino_cmd_motor(0, 0)
+
+
+
+if __name__ == "__main__":
+    from imu9_driver_v2 import Imu9IO
+    from gps_driver_v2 import GpsIO
+    from arduino_driver_v2 import ArduinoIO
+    ard = ArduinoIO()
+    gps = GpsIO()
+    imu = Imu9IO()
+    ddb = DDBoat(ard, gps, imu)
+    
+    ddb.tour_complet()
