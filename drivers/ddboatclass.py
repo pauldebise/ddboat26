@@ -4,8 +4,8 @@ from drivers.imu9_driver_v2 import Imu9IO
 
 class DDBoat:
 
-    def __init__(self, ard: ArduinoIO, gps: GpsIO, imu: Imu9IO) -> None:
-        self.ard = ard
-        self.gps = gps
-        self.imu = imu
+    def __init__(self, ard, gps, imu) -> None:
+        self.ard: ArduinoIO = ard
+        self.gps: GpsIO = gps
+        self.imu: Imu9IO = imu
 
