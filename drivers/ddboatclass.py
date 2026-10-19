@@ -30,6 +30,17 @@ def angle_diff(target, current):
 class DDBoat:
 
 
+    VITESSE_ROTATION = 60               # consigne moteur (0-255)
+    TOLERANCE_CAP = math.radians(10.0)  # ecart accepte autour du cap cible
+    TIMEOUT_PALIER = 15.0               # duree max pour atteindre un cap (s)
+    TEMPS_STABILISATION = 0.00          # pause moteurs arretes entre deux caps (s)
+    # Sens du tour : +1 = horaire (defaut), -1 = anti-horaire.
+    SENS_TOUR = 1
+    # Polarite des moteurs : +1 si (-VITESSE, +VITESSE) augmente le cap
+    # mesure, -1 si cette commande le fait diminuer. Le cap du capteur
+    # augmentant dans le sens horaire, la valeur par defaut est -1.
+    SENS_ROTATION = -1
+
     def __init__(self, ard, gps, imu) -> None:
         self.ard = ard
         self.gps = gps
@@ -77,32 +88,93 @@ class DDBoat:
     def current_cap_deg(self):
         return np.degrees(self.current_cap_rad())
 
-    def tour_complet(self):
-        cadran_dir = ["DEVANT", "GAUCHE", "DERRIERE", "DROITE", "DEVANT"]
-        cadrans = np.array([0.0, math.pi / 2, math.pi, 3*math.pi / 2])
-        cadrans += self.current_cap_rad()
-
-        for i in range(4):
-
-            while True:
-                # 1. On récupère le cap actuel du bateau
-                current = self.current_cap_rad()
-
-                VITESSE_ROTATION = 60
-                print(current)
-                if current > cadrans[i]:
-                    print("Cadrant", cadran_dir[i], cadran_dir[i+1], "atteint avec succès !")
-                    break
-                else:
-                    self.ard.send_arduino_cmd_motor(-VITESSE_ROTATION, VITESSE_ROTATION)
-
-                # Petite pause pour ne pas saturer le processeur du Raspberry Pi
-                time.sleep(0.05)
-
-
-            # Petite pause entre chaque quadrant si besoin de stabilisation
-            time.sleep(0.5)
+    def _arreter_moteurs(self):
+        """Coupe les deux moteurs."""
         self.ard.send_arduino_cmd_motor(0, 0)
+
+    def _tourner_vers_cap(self, cible):
+        """Fait tourner le bateau jusqu'au cap cible.
+
+        Retourne True si le cap est atteint, False si le temps maximum
+        est depasse.
+        """
+        cible %= 2 * math.pi
+        debut = time.monotonic()
+
+        while True:
+            current = self.current_cap_rad()
+
+            # angle_diff() donne l'ecart le plus court entre les deux caps,
+            # dans l'intervalle [-pi, pi]. C'est indispensable car les angles
+            # rebouclent a 2*pi (359 degres est proche de 1 degre).
+            erreur = angle_diff(cible, current)
+
+            if abs(erreur) <= self.TOLERANCE_CAP:
+                self._arreter_moteurs()
+                print("Cap atteint : {:.1f} deg (ecart {:.1f} deg)".format(
+                    math.degrees(current), math.degrees(erreur)))
+                return True
+
+            if time.monotonic() - debut > self.TIMEOUT_PALIER:
+                self._arreter_moteurs()
+                print("Echec : cap cible {:.1f} deg, cap actuel {:.1f} deg".format(
+                    math.degrees(cible), math.degrees(current)))
+                return False
+
+            # Le cap du capteur augmente dans le sens horaire.
+            # Une erreur positive signifie donc qu'il faut tourner a droite.
+            # SENS_ROTATION adapte la commande au sens physique des moteurs.
+            if erreur * self.SENS_ROTATION > 0:
+                self.ard.send_arduino_cmd_motor(-self.VITESSE_ROTATION,
+                                                self.VITESSE_ROTATION)
+            else:
+                self.ard.send_arduino_cmd_motor(self.VITESSE_ROTATION,
+                                                -self.VITESSE_ROTATION)
+
+            # Petite pause pour ne pas saturer le processeur du Raspberry Pi.
+            time.sleep(0.05)
+
+    def tour_complet(self):
+        """Fait faire au bateau un tour complet de 360 degres.
+
+        Par defaut (SENS_TOUR = 1), le bateau tourne dans le sens horaire :
+        cap de depart, +90 (droite), +180 (derriere), +270 (gauche), puis
+        +360 degres (retour au cap initial).
+        """
+        cap_initial = self.current_cap_rad()
+        offsets = [0.0, math.pi / 2, math.pi, 3 * math.pi / 2, 2 * math.pi]
+
+        # Sens horaire par defaut : +90 = droite, +180 = derriere,
+        # +270 = gauche, +360 = retour au cap initial.
+        if self.SENS_TOUR > 0:
+            cadran_dir = ["DEVANT", "DROITE", "DERRIERE", "GAUCHE", "DEVANT"]
+        else:
+            offsets = [-offset for offset in offsets]
+            cadran_dir = ["DEVANT", "GAUCHE", "DERRIERE", "DROITE", "DEVANT"]
+
+        print("=== Debut du tour complet ===")
+        print("Cap initial : {:.1f} deg".format(math.degrees(cap_initial)))
+
+        try:
+            for i, offset in enumerate(offsets):
+                cible = (cap_initial + offset) % (2 * math.pi)
+                print("--> Cap cible {} : {:.1f} deg".format(
+                    cadran_dir[i], math.degrees(cible)))
+
+                if not self._tourner_vers_cap(cible):
+                    print("Tour complet interrompu.")
+                    return False
+
+                # On laisse le bateau se stabiliser, moteurs arretes, avant
+                # de mesurer le cap suivant.
+                time.sleep(self.TEMPS_STABILISATION)
+
+            print("=== Tour complet termine ===")
+            return True
+        finally:
+            # Securite : on coupe les moteurs dans tous les cas, meme si une
+            # exception survient pendant la rotation.
+            self._arreter_moteurs()
 
 
 
