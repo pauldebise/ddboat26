@@ -62,4 +62,3 @@ if __name__ == "__main__":
     np.savetxt('magNorthWest.csv', data)
 
     print("\n[OK] magNorthWest.csv créé avec succès !")
-    print("     Tu peux maintenant lancer cap_sender_v3.py")

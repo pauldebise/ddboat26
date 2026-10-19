@@ -61,4 +61,3 @@ if __name__ == "__main__":
     np.savetxt('donnees_mag.csv', data, delimiter=',', fmt='%.6f')
 
     print("[OK] donnees_mag.csv sauvegardé.")
-    print("     Lance maintenant create_magNorthWest.py puis cap_sender_v3.py")
