@@ -112,6 +112,32 @@ def parser_trame_gll(trame):
     return lat, lon
 
 
+def parser_trame_gga(trame):
+    """Retourne (qualite, satellites, hdop) d'une trame GGA, sinon None."""
+    if not trame.startswith("$") or "*" not in trame:
+        return None
+    corps, somme = trame[1:].rsplit("*", 1)
+    try:
+        attendu = int(somme[:2], 16)
+    except ValueError:
+        return None
+    calcule = 0
+    for caractere in corps:
+        calcule ^= ord(caractere)
+    if calcule != attendu:
+        return None
+    champs = corps.split(",")
+    if len(champs) < 9:
+        return None
+    try:
+        qualite = int(champs[6]) if champs[6] else 0
+        satellites = int(champs[7]) if champs[7] else 0
+        hdop = float(champs[8]) if champs[8] else None
+    except ValueError:
+        return None
+    return qualite, satellites, hdop
+
+
 class DDBoat:
 
 
@@ -142,9 +168,27 @@ class DDBoat:
         self.instant_fix_gps = None         # time.monotonic() du dernier fix
         self.compteur_fix_gps = 0           # nombre de fix recus
 
+        self.derniere_trame_gll = None      # derniere trame GLL valide (texte)
+        self.gga = None                     # (qualite, satellites, hdop)
+        self.trames_invalides = 0           # trames GLL/GGA rejetees
+
         # Dernieres valeurs utiles pour la telemetrie (en radians).
         self.dernier_cap = None
         self.dernier_cap_cible = None
+        self.dernier_mag_brut = None
+
+        # Journal optionnel : fonction appelee avec (type, dict). Laisse a
+        # None, aucune donnee n'est enregistree.
+        self.journal = None
+
+    def _journaliser(self, type_evenement, **donnees):
+        """Transmet un evenement au journal, sans jamais bloquer le bateau."""
+        if self.journal is None:
+            return
+        try:
+            self.journal(type_evenement, donnees)
+        except Exception:
+            pass
 
     def calibration(self):
         """Lance les deux acquisitions puis charge/calcule la calibration."""
@@ -180,6 +224,7 @@ class DDBoat:
     def current_cap_rad(self):
         self._ensure_calibration()
         xmag, ymag, zmag = self.imu.read_mag_raw()
+        self.dernier_mag_brut = (xmag, ymag, zmag)
         heading_rad = compute_heading([xmag, ymag, zmag], self.invA, self.xbar)
         # Cap boussole : 0 = Nord, croissant dans le sens horaire.
         self.dernier_cap = heading_rad % (2 * math.pi)
@@ -214,23 +259,34 @@ class DDBoat:
                 self._arreter_moteurs()
                 print("Cap atteint : {:.1f} deg (ecart {:.1f} deg)".format(
                     math.degrees(current), math.degrees(erreur)))
+                self._journaliser("tour_palier", atteint=True,
+                                  cible=math.degrees(cible),
+                                  cap=math.degrees(current),
+                                  duree=time.monotonic() - debut)
                 return True
 
             if time.monotonic() - debut > self.TIMEOUT_PALIER:
                 self._arreter_moteurs()
                 print("Echec : cap cible {:.1f} deg, cap actuel {:.1f} deg".format(
                     math.degrees(cible), math.degrees(current)))
+                self._journaliser("tour_palier", atteint=False,
+                                  cible=math.degrees(cible),
+                                  cap=math.degrees(current),
+                                  duree=time.monotonic() - debut)
                 return False
 
             # Le cap du capteur augmente dans le sens horaire.
             # Une erreur positive signifie donc qu'il faut tourner a droite.
             # SENS_ROTATION adapte la commande au sens physique des moteurs.
             if erreur * self.SENS_ROTATION > 0:
-                self.ard.send_arduino_cmd_motor(-self.VITESSE_ROTATION,
-                                                self.VITESSE_ROTATION)
+                commande = (-self.VITESSE_ROTATION, self.VITESSE_ROTATION)
             else:
-                self.ard.send_arduino_cmd_motor(self.VITESSE_ROTATION,
-                                                -self.VITESSE_ROTATION)
+                commande = (self.VITESSE_ROTATION, -self.VITESSE_ROTATION)
+            self.ard.send_arduino_cmd_motor(commande[0], commande[1])
+            self._journaliser("tour", cible=math.degrees(cible),
+                              cap=math.degrees(current),
+                              erreur=math.degrees(erreur),
+                              moteurs=commande, mag=self.dernier_mag_brut)
 
             # Petite pause pour ne pas saturer le processeur du Raspberry Pi.
             time.sleep(0.05)
@@ -255,6 +311,8 @@ class DDBoat:
 
         print("=== Debut du tour complet ===")
         print("Cap initial : {:.1f} deg".format(math.degrees(cap_initial)))
+        self._journaliser("tour_debut", cap_initial=math.degrees(cap_initial),
+                          sens=self.SENS_TOUR)
 
         try:
             for i, offset in enumerate(offsets):
@@ -341,6 +399,7 @@ class DDBoat:
                     self._tampon_gps += ser.read(disponibles)
             except Exception as exc:
                 print("Erreur de lecture GPS : {}".format(exc))
+                self._journaliser("gps_erreur", erreur=repr(exc))
                 return False
 
             lignes = self._tampon_gps.split(b"\n")
@@ -351,12 +410,29 @@ class DDBoat:
 
             for brute in lignes:
                 trame = brute.decode("ascii", "ignore").strip()
+                entete = trame.split(",", 1)[0]
+                if entete.endswith("GGA"):
+                    # Qualite du fix, pour diagnostiquer le GPS dans le journal.
+                    gga = parser_trame_gga(trame)
+                    if gga is None:
+                        self.trames_invalides += 1
+                        self._journaliser("gps_trame_rejetee", trame=trame)
+                    else:
+                        self.gga = gga
+                    continue
+                if not entete.endswith("GLL"):
+                    continue
                 position = parser_trame_gll(trame)
-                if position is not None:
-                    self.derniere_position_gps = position
-                    self.instant_fix_gps = time.monotonic()
-                    self.compteur_fix_gps += 1
-                    nouvelle = True
+                if position is None:
+                    # Trame tronquee, checksum faux ou pas de fix.
+                    self.trames_invalides += 1
+                    self._journaliser("gps_trame_rejetee", trame=trame)
+                    continue
+                self.derniere_position_gps = position
+                self.derniere_trame_gll = trame
+                self.instant_fix_gps = time.monotonic()
+                self.compteur_fix_gps += 1
+                nouvelle = True
         return nouvelle
 
     def age_fix_gps(self):
@@ -454,10 +530,13 @@ class DDBoat:
         Retourne True si la base est atteinte, False si timeout est depasse.
         """
         debut = time.monotonic()
+        gps_perime = False
         try:
             while True:
                 if timeout is not None and time.monotonic() - debut > timeout:
                     print("Homing : temps maximal depasse.")
+                    self._journaliser("homing_fin", arrive=False,
+                                      raison="timeout")
                     return False
 
                 # Une seule lecture par iteration, dans le meme repere (avec
@@ -469,16 +548,35 @@ class DDBoat:
                 if position is None or age is None or age > age_fix_max:
                     # Pas de position fiable : on ne navigue pas a l'aveugle.
                     self._arreter_moteurs()
+                    if not gps_perime:
+                        self._journaliser("gps_perime", age=age)
+                        gps_perime = True
                     time.sleep(0.2)
                     continue
+                if gps_perime:
+                    self._journaliser("gps_retabli", age=age)
+                    gps_perime = False
 
                 x, y = position
-                if dist_cart((x, y), Environnement.home) <= rayon_arrivee:
+                distance = dist_cart((x, y), Environnement.home)
+                if distance <= rayon_arrivee:
                     print("Base atteinte.")
+                    self._journaliser("homing_fin", arrive=True, x=x, y=y,
+                                      distance=distance)
                     return True
 
-                self.maintien_cap(Environnement.direction(x, y),
-                                  Environnement.rotation)
+                direction = Environnement.direction(x, y)
+                cible, cap, gauche, droite = self.maintien_cap(
+                    direction, Environnement.rotation)
+                self._journaliser("homing", x=x, y=y, age=age,
+                                  distance=distance,
+                                  direction=(float(direction[0]),
+                                             float(direction[1])),
+                                  cap_cible=math.degrees(cible),
+                                  cap=math.degrees(cap),
+                                  erreur=math.degrees(angle_diff(cible, cap)),
+                                  moteurs=(gauche, droite),
+                                  mag=self.dernier_mag_brut)
                 time.sleep(0.05)
         finally:
             # Securite : moteurs coupes a l'arrivee comme en cas d'erreur.
