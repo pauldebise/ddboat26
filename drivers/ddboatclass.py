@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from setuptools.msvc import EnvironmentInfo
 
 # Import compatible avec les deux usages :
 #   - depuis la racine du dépôt : from drivers.ddboatclass import DDBoat
@@ -33,6 +34,35 @@ def vector_to_heading_cartesian(x, y):
   """
   return math.atan2(y, x)
 
+def calculer_distance_gps(lat1, lon1, lat2, lon2):
+    # Rayon moyen de la Terre en mètres
+    R = 6371000.0
+
+    # Conversion des degrés en radians
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+
+    # Différences de coordonnées
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+
+    # Formule de Haversine
+    a = ( math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    # Distance en mètres
+    distance = R * c
+    return distance
+
+
+def dist_cart(A,B):
+    yA = A[0]
+    xA = A[1]
+    yB = B[0]
+    xB = B[1]
+    return math.sqrt((yA - yB) ** 2 + (xA - xB) ** 2)
 
 class DDBoat:
 
@@ -282,13 +312,13 @@ class DDBoat:
 
     def homing(self, Environnement):
 
-
-        if Environnement.lim() == 1:
+        if not Environnement.lim():
             while True:
-                if self.gps.
-                    self.maintien_cap(Environnement.direction()):
+                if dist_cart(self.get_DDboat_cart_position(Environnement.home_latlong, Environnement.rotation), Environnement.home) > 5:
+                    self.maintien_cap(Environnement.direction())
                 else:
                     break
+                time.sleep(0.05)
 
 
 
