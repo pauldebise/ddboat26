@@ -123,8 +123,69 @@ class Environnement:
         return k_ligne * gradient_ligne + k_uniforme * gradient_uniforme
 
     def lim(self, x, y):
-        """Vérifie si le point (x, y) est à l'intérieur des limites du couloir."""
-        # Vérification des bordures gauche et droite
-        if (coord_bordure_gauche[0][0] <= x <= coord_bordure_droite[0][0]) and (coord_bordure_gauche[1][1] <= y <= coord_bordure_droite[1][1]):
-            return True
-        return False
+        """Indique si (x, y) est entre les bordures laterales du couloir.
+
+        Il n'y a pas de bordure avant ou arriere : on ne teste que les deux
+        demi-plans definis par les droites de bordure. Un point situe au-dela
+        de C1 ou de C2 mais toujours entre les deux droites reste donc dans
+        les limites.
+
+        L'ancien test comparait x et y a un rectangle, avec des bornes
+        inversees (0.74 <= x <= -98.87), donc il renvoyait toujours False.
+        Ici on calcule une distance signee a chaque bordure :
+          - d_droite > 0 : point a droite de la bordure droite ;
+          - d_gauche > 0 : point a gauche de la bordure gauche.
+        Le point est dans les limites si les deux distances sont <= 0.
+
+        x et y doivent etre exprimes dans le meme repere local que
+        self.bordure_gauche et self.bordure_droite.
+        """
+        point = np.array([x, y], dtype=float)
+
+        # Direction du couloir, de la base C1 vers l'entree C2.
+        c1 = self.couloir[0]
+        c2 = self.couloir[1]
+        u = np.array(c2 - c1, dtype=float)
+        norme_u = np.linalg.norm(u)
+        if norme_u < 1e-9:
+            return False
+        u = u / norme_u
+
+        # Normales exterieures attendues, dans un repere x=est, y=nord.
+        # (u_y, -u_x) est le cote droit du couloir ; son oppose est le gauche.
+        normale_droite = np.array([u[1], -u[0]])
+        normale_gauche = -normale_droite
+
+        def distance_signee(bordure, normale_attendue):
+            """Distance signee a la droite support de la bordure.
+
+            La normale de la bordure est orientee dans le sens de
+            normale_attendue, pour que d > 0 signifie "exterieur".
+            """
+            a = np.array(bordure[0], dtype=float)
+            b = np.array(bordure[1], dtype=float)
+            v = b - a
+            norme_v = np.linalg.norm(v)
+            if norme_v < 1e-9:
+                return None
+            v = v / norme_v
+
+            # Normale de la droite ; on la retourne si elle pointe vers
+            # l'interieur au lieu de l'exterieur.
+            normale = np.array([-v[1], v[0]])
+            if np.dot(normale, normale_attendue) < 0.0:
+                normale = -normale
+
+            return float(np.dot(point - a, normale))
+
+        d_droite = distance_signee(self.bordure_droite, normale_droite)
+        d_gauche = distance_signee(self.bordure_gauche, normale_gauche)
+
+        # Une bordure degeneree ne permet pas de conclure : par prudence,
+        # on considere le point hors limites.
+        if d_droite is None or d_gauche is None:
+            return False
+
+        # Aucune condition sur la coordonnee le long du couloir : il n'y a
+        # pas de bordure avant/arriere.
+        return d_droite <= 0.0 and d_gauche <= 0.0
