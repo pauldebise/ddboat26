@@ -21,6 +21,10 @@ Usages
     python3 ihm_lac.py --live --gps 1 --host 0.0.0.0 --port 8080
         GPS sur /dev/ttyGPS1, interface accessible depuis le reseau local.
 
+    python3 ihm_lac.py --mission --host 0.0.0.0 --no-browser
+        Affiche la telemetrie envoyee par mission_sortie_retour.py (UDP 5006)
+        sans ouvrir le GPS.
+
 Commandes
 ---------
 Molette ou pincement : zoom ; glisser : deplacer.
@@ -1549,6 +1553,119 @@ class LiveBoat(object):
                 pass
 
 
+class MissionBoat(object):
+    """Telemetrie UDP envoyee par mission_sortie_retour.py.
+
+    La mission possede le GPS, les moteurs et l'IMU ; l'IHM se contente
+    d'ecouter. Cela evite d'ouvrir le GPS deux fois.
+    """
+
+    PHASES = {
+        "INIT": "Initialisation",
+        "ATTENTE_GPS": "Attente GPS",
+        "SORTIE": "Sortie de zone",
+        "HORS_LIMITES": "Hors limites detecte",
+        "TOUR": "Tour complet",
+        "RETOUR": "Retour a la base",
+        "ARRIVEE": "Base atteinte",
+        "ECHEC": "Echec",
+    }
+
+    def __init__(self, env, port=5006):
+        self.env = env
+        self.port = port
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.paquet = None
+        self.recu = None
+        self.trail = deque(maxlen=800)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("0.0.0.0", port))
+        self.sock.settimeout(0.5)
+        self.thread = threading.Thread(target=self._ecouter, name="telemetrie-mission")
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _ecouter(self):
+        while not self.stop.is_set():
+            try:
+                donnees, _ = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                paquet = json.loads(donnees.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(paquet, dict) or paquet.get("source") != "ddboat-mission":
+                continue
+            with self.lock:
+                self.paquet = paquet
+                self.recu = time.monotonic()
+                x, y = paquet.get("x"), paquet.get("y")
+                if x is not None and y is not None and (
+                        not self.trail or
+                        math.hypot(x - self.trail[-1][0], y - self.trail[-1][1]) >= 0.7):
+                    self.trail.append([float(x), float(y)])
+
+    def _texte(self, p):
+        morceaux = [self.PHASES.get(p.get("phase"), p.get("phase") or "?")]
+        if p.get("dans_zone") is not None:
+            morceaux.append("dans la zone" if p["dans_zone"] else "HORS LIMITES")
+        if p.get("cap") is not None:
+            cap = "cap {:.0f}°".format(p["cap"])
+            if p.get("cap_cible") is not None:
+                cap += " → {:.0f}°".format(p["cap_cible"])
+            morceaux.append(cap)
+        if p.get("moteurs"):
+            morceaux.append("moteurs {}/{}".format(p["moteurs"][0], p["moteurs"][1]))
+        if p.get("message"):
+            morceaux.append(p["message"])
+        return " · ".join(morceaux)
+
+    def get_state(self):
+        maintenant = time.monotonic()
+        with self.lock:
+            if self.paquet is None:
+                return {
+                    "boat": None,
+                    "trail": [],
+                    "age": None,
+                    "stale": True,
+                    "notice": "En attente de la mission (UDP {})".format(self.port),
+                }
+            p = dict(self.paquet)
+            age = maintenant - self.recu
+            trail = [[_arrondi(px, 1), _arrondi(py, 1)] for px, py in self.trail]
+
+        if p.get("fix_age") is not None:
+            age += float(p["fix_age"])
+        notice = self._texte(p)
+        if p.get("x") is None:
+            return {"boat": None, "trail": trail, "age": None, "stale": True,
+                    "notice": notice}
+        return {
+            "x": float(p["x"]),
+            "y": float(p["y"]),
+            "lat": p.get("lat"),
+            "lon": p.get("lon"),
+            "heading": p.get("heading") or 0.0,
+            "speed": 0.0,
+            "heading_source": "compas",
+            "trail": trail,
+            "age": age,
+            "stale": age > 3.0,
+            "notice": notice,
+        }
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=1.5)
+        self.sock.close()
+
+
 class AppState(object):
     def __init__(self, env, bateau, mode, notice):
         self.env = env
@@ -1659,6 +1776,10 @@ def parser_arguments(argv=None):
                         help="lire la position GPS reelle au lieu de la simulation")
     parser.add_argument("--gps", type=int, choices=(0, 1, 2), default=0,
                         help="peripherique GPS : /dev/ttyGPS0, 1 ou 2 (defaut : 0)")
+    parser.add_argument("--mission", action="store_true",
+                        help="afficher la telemetrie de mission_sortie_retour.py")
+    parser.add_argument("--udp-port", type=int, default=5006,
+                        help="port UDP de la telemetrie de mission (defaut : 5006)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="adresse d'ecoute (defaut : 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000,
@@ -1681,7 +1802,16 @@ def main(argv=None):
     notice = "Simulation : trajectoire le long du gradient"
     bateau = None
 
-    if args.live:
+    if args.mission:
+        try:
+            bateau = MissionBoat(env, port=args.udp_port)
+            mode = "live"
+            notice = "Telemetrie de mission"
+            print("Ecoute de la telemetrie de mission sur le port UDP {}.".format(args.udp_port))
+        except OSError as exc:
+            print("Impossible d'ouvrir le port UDP {} : {}".format(args.udp_port, exc))
+            return 1
+    elif args.live:
         try:
             bateau = LiveBoat(env, gps_index=args.gps)
             mode = "live"
