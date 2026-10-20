@@ -1,6 +1,7 @@
 import math
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 import numpy as np
@@ -62,6 +63,55 @@ def dist_cart(A,B):
     xB = B[1]
     return math.sqrt((yA - yB) ** 2 + (xA - xB) ** 2)
 
+
+def nmea_vers_degres(valeur, hemisphere):
+    """Convertit une coordonnee NMEA (ddmm.mmmm / dddmm.mmmm) en degres.
+
+    Le GPS ne donne pas des degres decimaux : 4811.932 signifie
+    48 deg 11.932 min, soit 48.19887 deg. L'hemisphere S ou W rend la
+    valeur negative (la longitude du lac est donc -3.01...).
+    """
+    brut = float(valeur)
+    degres = int(brut // 100)
+    minutes = brut - degres * 100
+    decimal = degres + minutes / 60.0
+    if hemisphere.upper() in ("S", "W"):
+        decimal = -decimal
+    return decimal
+
+
+def parser_trame_gll(trame):
+    """Retourne (lat, lon) en degres decimaux pour une trame GLL valide.
+
+    Retourne None si la trame est tronquee (checksum faux), si ce n'est pas
+    une trame GLL ou si le GPS n'a pas de fix (statut different de 'A').
+    """
+    if not trame.startswith("$") or "*" not in trame:
+        return None
+    corps, somme = trame[1:].rsplit("*", 1)
+    try:
+        attendu = int(somme[:2], 16)
+    except ValueError:
+        return None
+    calcule = 0
+    for caractere in corps:
+        calcule ^= ord(caractere)
+    if calcule != attendu:
+        return None
+
+    champs = corps.split(",")
+    if len(champs) < 7 or not champs[0].endswith("GLL"):
+        return None
+    if champs[6] != "A":
+        return None
+    try:
+        lat = nmea_vers_degres(champs[1], champs[2])
+        lon = nmea_vers_degres(champs[3], champs[4])
+    except ValueError:
+        return None
+    return lat, lon
+
+
 class DDBoat:
 
 
@@ -82,6 +132,19 @@ class DDBoat:
         self.imu = imu
         self.invA = None
         self.xbar = None
+
+        # Etat du GPS : tampon des octets recus et dernier fix valide.
+        # Le verrou permet de lire le GPS depuis un second thread
+        # (telemetrie vers l'IHM) sans melanger les trames.
+        self._tampon_gps = b""
+        self._verrou_gps = threading.Lock()
+        self.derniere_position_gps = None   # (lat, lon) en degres decimaux
+        self.instant_fix_gps = None         # time.monotonic() du dernier fix
+        self.compteur_fix_gps = 0           # nombre de fix recus
+
+        # Dernieres valeurs utiles pour la telemetrie (en radians).
+        self.dernier_cap = None
+        self.dernier_cap_cible = None
 
     def calibration(self):
         """Lance les deux acquisitions puis charge/calcule la calibration."""
@@ -118,7 +181,9 @@ class DDBoat:
         self._ensure_calibration()
         xmag, ymag, zmag = self.imu.read_mag_raw()
         heading_rad = compute_heading([xmag, ymag, zmag], self.invA, self.xbar)
-        return heading_rad % (2 * math.pi)
+        # Cap boussole : 0 = Nord, croissant dans le sens horaire.
+        self.dernier_cap = heading_rad % (2 * math.pi)
+        return self.dernier_cap
 
     def current_cap_deg(self):
         return np.degrees(self.current_cap_rad())
@@ -134,6 +199,7 @@ class DDBoat:
         est depasse.
         """
         cible %= 2 * math.pi
+        self.dernier_cap_cible = cible
         debut = time.monotonic()
 
         while True:
@@ -246,76 +312,177 @@ class DDBoat:
 
 
 
-    def get_DDboat_cart_position(self, origin, angle_rotation=0.0):
-        """Convertit la position GPS actuelle (lat, long)
+    def mise_a_jour_gps(self):
+        """Lit toutes les trames GPS disponibles, sans bloquer.
 
-        en coordonnées cartésiennes locales (x, y en mètres) par rapport à l'origine.
+        L'ancienne lecture (read_gll_non_blocking) lisait une seule ligne
+        avec un timeout de 10 ms : la ligne pouvait etre tronquee, et la
+        plupart du temps ce n'etait pas une trame GLL. Elle renvoyait alors
+        [0., 'N', 0., 'W', 0.], c'est-a-dire une position a l'equateur.
 
-        origin : tuple (lat_origin, lon_origin) en degrés
-        angle_rotation : angle optionnel (en radians) pour orienter le repère local
+        Ici les octets recus sont accumules dans un tampon et decoupes en
+        lignes completes. Seules les trames GLL au checksum correct et avec
+        un fix valide mettent a jour la derniere position connue.
+
+        Retourne True si une nouvelle position a ete recue.
         """
-        msg, pos = self.gps.read_gll_non_blocking()
+        if self.gps is None:
+            return False
 
-        # Vérification de sécurité si le GPS ne renvoie pas de données valides
+        nouvelle = False
+        with self._verrou_gps:
+            ser = self.gps.ser
+            try:
+                if hasattr(ser, "in_waiting"):
+                    disponibles = ser.in_waiting
+                else:
+                    disponibles = ser.inWaiting()
+                if disponibles > 0:
+                    self._tampon_gps += ser.read(disponibles)
+            except Exception as exc:
+                print("Erreur de lecture GPS : {}".format(exc))
+                return False
 
-        lat, lon = pos[0], pos[2]
-        lat_orig, lon_orig = origin[0], origin[1]
+            lignes = self._tampon_gps.split(b"\n")
+            # La derniere ligne est incomplete : on la garde pour la suite.
+            self._tampon_gps = lignes.pop()
+            if len(self._tampon_gps) > 512:
+                self._tampon_gps = b""
 
-        # Rayon moyen de la Terre en mètres
-        R = 6371000.0
+            for brute in lignes:
+                trame = brute.decode("ascii", "ignore").strip()
+                position = parser_trame_gll(trame)
+                if position is not None:
+                    self.derniere_position_gps = position
+                    self.instant_fix_gps = time.monotonic()
+                    self.compteur_fix_gps += 1
+                    nouvelle = True
+        return nouvelle
 
-        # 1. Conversion des coordonnées en radians
-        lat_rad = math.radians(lat)
-        lon_rad = math.radians(lon)
-        lat_orig_rad = math.radians(lat_orig)
-        lon_orig_rad = math.radians(lon_orig)
+    def age_fix_gps(self):
+        """Age du dernier fix GPS en secondes, ou None si aucun fix."""
+        if self.instant_fix_gps is None:
+            return None
+        return time.monotonic() - self.instant_fix_gps
 
-        # 2. Calcul des distances en mètres (Repère Est / Nord brut)
-        # dy = distance vers le Nord
-        dy = (lat_rad - lat_orig_rad) * R
-        # dx = distance vers l'Est (pondérée par le cosinus de la latitude)
-        dx = (lon_rad - lon_orig_rad) * R * math.cos(lat_orig_rad)
+    def get_DDboat_cart_position(self, origin, angle_rotation=0.0):
+        """Convertit la derniere position GPS en coordonnees locales (x, y).
 
-        # 3. Application d'une rotation si votre repère local est orienté
-        # (Par exemple si l'axe X de votre lac n'est pas strictement orienté vers l'Est géographique)
-        if angle_rotation != 0.0:
-            x_rot = dx * math.cos(angle_rotation) + dy * math.sin(angle_rotation)
-            y_rot = -dx * math.sin(angle_rotation) + dy * math.cos(angle_rotation)
-            return x_rot, y_rot
+        origin : tuple (lat_origin, lon_origin) en degres
+        angle_rotation : angle optionnel (en radians) pour orienter le repere local
 
-        return dx, dy
+        Retourne None tant qu'aucun fix GPS valide n'a ete recu.
 
-    def maintien_cap(self,target_dir):
-        """Calcule et applique la vitesse des moteurs pour maintenir le cap cible (target_heading)."""
+        Correction : les valeurs NMEA (ddmm.mmmm) etaient utilisees comme des
+        degres decimaux et l'hemisphere W etait ignore. La position calculee
+        etait donc a des milliers de kilometres de la base, et la direction
+        donnee par Environnement.direction() n'avait aucun sens.
+        """
+        self.mise_a_jour_gps()
+        if self.derniere_position_gps is None:
+            return None
+        lat, lon = self.derniere_position_gps
+        return self.convert_cart_position(lat, lon, origin, angle_rotation)
+
+    def attendre_position(self, origin, angle_rotation=0.0, timeout=120.0):
+        """Attend un premier fix GPS. Retourne (x, y) ou None apres timeout."""
+        debut = time.monotonic()
+        dernier_message = debut
+        while time.monotonic() - debut < timeout:
+            position = self.get_DDboat_cart_position(origin, angle_rotation)
+            if position is not None:
+                return position
+            if time.monotonic() - dernier_message > 5.0:
+                print("En attente d'un fix GPS...")
+                dernier_message = time.monotonic()
+            time.sleep(0.1)
+        return None
+
+    def maintien_cap(self, target_dir, angle_rotation=0.0):
+        """Calcule et applique la vitesse des moteurs pour suivre target_dir.
+
+        target_dir est un vecteur (x, y) du repere local du lac.
+        Retourne (cap_cible, cap_actuel, moteur_gauche, moteur_droit).
+        """
         Kp = 25
         v_base = 150
 
-        current_cap = self.current_cap_rad()  # ou votre méthode de cap actuel
-        target_cap = vector_to_heading_cartesian(target_dir[0], target_dir[1])
+        current_cap = self.current_cap_rad()
+
+        # Correction 1 : convention d'angle.
+        # current_cap_rad() est un cap boussole (0 = Nord, sens horaire),
+        # alors que atan2(y, x) donne un angle mathematique (0 = Est, sens
+        # anti-horaire). Le cap boussole d'un vecteur (Est, Nord) est
+        # atan2(Est, Nord). L'ancien calcul avait 90 deg d'ecart, et le
+        # signe "-" ajoute ensuite donnait toujours 90 deg d'ecart.
+        vx = float(target_dir[0])
+        vy = float(target_dir[1])
+        if angle_rotation != 0.0:
+            # Repere local tourne : on ramene le vecteur en (Est, Nord).
+            est = vx * math.cos(angle_rotation) - vy * math.sin(angle_rotation)
+            nord = vx * math.sin(angle_rotation) + vy * math.cos(angle_rotation)
+        else:
+            est, nord = vx, vy
+        target_cap = math.atan2(est, nord) % (2 * math.pi)
+        self.dernier_cap_cible = target_cap
+
         error = angle_diff(target_cap, current_cap)
 
         # Asservissement proportionnel simple
         u = Kp * error
 
-        # Envoi de la commande aux moteurs gauche / droite
-
-        speed_left = v_base - u
-        speed_right = v_base + u
-        if speed_left > 191:
-            speed_left = 191
-        if speed_right > 191:
-            speed_right = 191
+        # Correction 2 : sens de la commande.
+        # error > 0 signifie qu'il faut augmenter le cap, donc tourner a
+        # droite. L'ancien code accelerait alors le moteur droit, ce qui
+        # fait tourner a gauche : la boucle s'eloignait de la consigne et se
+        # stabilisait a l'oppose, d'ou un bateau qui part a l'oppose de la
+        # base. On reutilise SENS_ROTATION, deja valide par tour_complet() :
+        # avec SENS_ROTATION = -1, tourner a droite = moteur gauche plus
+        # rapide que le moteur droit.
+        speed_left = v_base - self.SENS_ROTATION * u
+        speed_right = v_base + self.SENS_ROTATION * u
+        speed_left = max(0, min(191, speed_left))
+        speed_right = max(0, min(191, speed_right))
 
         self.ard.send_arduino_cmd_motor(speed_left, speed_right)
+        return target_cap, current_cap, speed_left, speed_right
 
-    def homing(self, Environnement):
-        while True:
-            if dist_cart(self.get_DDboat_cart_position(Environnement.home_latlong, Environnement.rotation), Environnement.home) > 5:
-                x, y = self.get_DDboat_cart_position(Environnement.home_latlong)
-                self.maintien_cap(Environnement.direction(x, y))
-            else:
-                break
-            time.sleep(0.05)
+    def homing(self, Environnement, rayon_arrivee=5.0, timeout=None,
+               age_fix_max=3.0):
+        """Ramene le bateau a la base en suivant Environnement.direction().
+
+        Retourne True si la base est atteinte, False si timeout est depasse.
+        """
+        debut = time.monotonic()
+        try:
+            while True:
+                if timeout is not None and time.monotonic() - debut > timeout:
+                    print("Homing : temps maximal depasse.")
+                    return False
+
+                # Une seule lecture par iteration, dans le meme repere (avec
+                # rotation) que la base, le couloir et les bordures. Avant,
+                # la distance utilisait la rotation mais pas la direction.
+                position = self.get_DDboat_cart_position(
+                    Environnement.home_latlong, Environnement.rotation)
+                age = self.age_fix_gps()
+                if position is None or age is None or age > age_fix_max:
+                    # Pas de position fiable : on ne navigue pas a l'aveugle.
+                    self._arreter_moteurs()
+                    time.sleep(0.2)
+                    continue
+
+                x, y = position
+                if dist_cart((x, y), Environnement.home) <= rayon_arrivee:
+                    print("Base atteinte.")
+                    return True
+
+                self.maintien_cap(Environnement.direction(x, y),
+                                  Environnement.rotation)
+                time.sleep(0.05)
+        finally:
+            # Securite : moteurs coupes a l'arrivee comme en cas d'erreur.
+            self._arreter_moteurs()
 
 
 
@@ -332,8 +499,13 @@ if __name__ == "__main__":
     ddb = DDBoat(ard, gps, imu)
     
     lac = Environnement()
-    x, y = ddb.get_DDboat_cart_position(lac.home_latlong)
-    if not lac.lim(x, y):
-        ddb.tour_complet()
+    position = ddb.attendre_position(lac.home_latlong, lac.rotation)
+    if position is None:
+        print("Aucun fix GPS : arret.")
+    else:
+        x, y = position
+        if not lac.lim(x, y):
+            print("Hors limites : tour complet puis retour a la base.")
+            ddb.tour_complet()
         ddb.homing(lac)
     print("Fini!")
