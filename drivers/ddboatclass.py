@@ -3,9 +3,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-
 import numpy as np
-from setuptools.msvc import EnvironmentInfo
 
 # Import compatible avec les deux usages :
 #   - depuis la racine du dépôt : from drivers.ddboatclass import DDBoat
@@ -289,7 +287,7 @@ class DDBoat:
 
     def maintien_cap(self,target_dir):
         """Calcule et applique la vitesse des moteurs pour maintenir le cap cible (target_heading)."""
-        Kp = 40
+        Kp = 25
         v_base = 150
 
         current_cap = self.current_cap_rad()  # ou votre méthode de cap actuel
@@ -308,12 +306,13 @@ class DDBoat:
         if speed_right > 191:
             speed_right = 191
 
-        self.ard.set_motor_speeds(speed_left, speed_right)
+        self.ard.send_arduino_cmd_motor(speed_left, speed_right)
 
     def homing(self, Environnement):
         while True:
             if dist_cart(self.get_DDboat_cart_position(Environnement.home_latlong, Environnement.rotation), Environnement.home) > 5:
-                self.maintien_cap(Environnement.direction())
+                x, y = self.get_DDboat_cart_position(Environnement.home_latlong)
+                self.maintien_cap(Environnement.direction(x, y))
             else:
                 break
             time.sleep(0.05)
@@ -323,6 +322,7 @@ class DDBoat:
 
 
 if __name__ == "__main__":
+    from environnementclass import Environnement
     from imu9_driver_v2 import Imu9IO
     from gps_driver_v2 import GpsIO
     from arduino_driver_v2 import ArduinoIO
@@ -331,4 +331,6 @@ if __name__ == "__main__":
     imu = Imu9IO()
     ddb = DDBoat(ard, gps, imu)
     
-    ddb.tour_complet()
+    lac = Environnement()
+    ddb.homing(lac)
+    print("Fini!")
