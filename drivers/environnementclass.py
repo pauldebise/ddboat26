@@ -1,15 +1,29 @@
 from ddboatclass import DDBoat
 import numpy as np
 
-coord_couloir = np.array([[0.0, 0.0], [1.0, 0.0]])
-coord_bordure_gauche = np.array([[-1.0, 0.0], [-1.0, 1.0]])
-coord_bordure_droite = np.array([[1.0, 0.0], [1.0, 1.0]])
+coord_home = np.array([0, 0])
+coord_couloir = np.array([[48.198863,-3.015070], [48.199072,-3.016258]])
+coord_bordure_gauche = np.array([[48.197408,-3.01506], [48.1970689,-3.017328]])
+coord_bordure_droite = np.array([[48.199707,-3.016404], [48.199814,-3.015137]])
+
+ddb_calcul = DDBoat(None, None, None)  # Instance de DDBoat pour les calculs de coordonnées
+coord_bordure_gauche[0] = ddb_calcul.convert_cart_position(coord_bordure_gauche[0][0], coord_bordure_gauche[0][1], coord_home[0], 0)
+coord_bordure_gauche[1] = ddb_calcul.convert_cart_position(coord_bordure_gauche[1][0], coord_bordure_gauche[1][1], coord_home[0], 0)
+coord_bordure_droite[0] = ddb_calcul.convert_cart_position(coord_bordure_droite[0][0], coord_bordure_droite[0][1], coord_home[0], 0)
+coord_bordure_droite[1] = ddb_calcul.convert_cart_position(coord_bordure_droite[1][0], coord_bordure_droite[1][1], coord_home[0], 0)
+coord_couloir[0] = ddb_calcul.convert_cart_position(coord_couloir[0][0], coord_couloir[0][1], coord_home[0], 0)
+coord_couloir[1] = ddb_calcul.convert_cart_position(coord_couloir[1][0], coord_couloir[1][1], coord_home[0], 0)
+print("Coordonnées converties.")
+
 
 
 class Environnement:
-    def __init__(self, ddboat: DDBoat):
-        self.ddboat = ddboat
+
+    def __init__(self):
         self.home = np.array([0.0, 0.0])  # position de la base dans le repere local (x, y).
+        self.couloir = coord_couloir  # position du couloir dans le repere local (x, y).
+        self.bordure_gauche = coord_bordure_gauche  # position de la bordure gauche dans le repere local (x, y).
+        self.bordure_droite = coord_bordure_droite  # position de la bordure droite dans le repere local (x, y).
 
     def gradient_artificiel_point(self, x_pt: float, y_pt: float, x_pos: float, y_pos: float, attract: bool):
         signe = (-1) if attract else 1
@@ -18,10 +32,20 @@ class Environnement:
     def gradient_artificiel_ligne(self, x_n: float, y_n: float, x_pt: float, y_pt: float, x_pos: float, y_pos: float):
         n = np.array([x_n, y_n])
         Q = n@n.T
-        pp = np.array([x_pos-x_pt, y_pos-x_pt])
+        pp = np.array([x_pos-x_pt, y_pos-y_pt])
         return -2 * Q@pp
 
     def gradient_artificiel_uniforme(self, x_v, y_v):
         return np.array([x_v, y_v])
 
-    
+    def direction(self, x, y):
+        gradient_ligne = self.gradient_artificiel_ligne(self.couloir[1][0]-self.couloir[0][0], self.couloir[1][1]-self.couloir[0][1], self.couloir[0][0], self.couloir[0][1], x, y)
+        gradient_uniforme = self.gradient_artificiel_uniforme(0, -1)
+        return gradient_ligne + gradient_uniforme
+
+    def lim(self, x, y):
+        """Vérifie si le point (x, y) est à l'intérieur des limites du couloir."""
+        # Vérification des bordures gauche et droite
+        if (coord_bordure_gauche[0][0] <= x <= coord_bordure_droite[0][0]) and (coord_bordure_gauche[1][1] <= y <= coord_bordure_droite[1][1]):
+            return True
+        return False
