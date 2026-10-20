@@ -583,6 +583,18 @@ class DDBoat:
             self._arreter_moteurs()
 
 
+    def rejoindre_keeping_zone(self, pos_keep_point, origin):
+        tolerance = 2
+        while True:
+            pos = self.get_DDboat_cart_position(origin)
+            if dist_cart(pos,pos_keep_point) < tolerance:
+                break
+            else:
+                direction = pos_keep_point - pos
+                ddb.maintien_cap(direction, origin)
+            time.sleep(0.05)
+
+
 
 
 
