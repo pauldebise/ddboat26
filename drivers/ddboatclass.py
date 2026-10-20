@@ -311,14 +311,13 @@ class DDBoat:
         self.ard.set_motor_speeds(speed_left, speed_right)
 
     def homing(self, Environnement):
+        while True:
+            if dist_cart(self.get_DDboat_cart_position(Environnement.home_latlong, Environnement.rotation), Environnement.home) > 5:
+                self.maintien_cap(Environnement.direction())
+            else:
+                break
+            time.sleep(0.05)
 
-        if not Environnement.lim():
-            while True:
-                if dist_cart(self.get_DDboat_cart_position(Environnement.home_latlong, Environnement.rotation), Environnement.home) > 5:
-                    self.maintien_cap(Environnement.direction())
-                else:
-                    break
-                time.sleep(0.05)
 
 
 
