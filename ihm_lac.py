@@ -21,9 +21,11 @@ Usages
     python3 ihm_lac.py --live --gps 1 --host 0.0.0.0 --port 8080
         GPS sur /dev/ttyGPS1, interface accessible depuis le reseau local.
 
-    python3 ihm_lac.py --mission --host 0.0.0.0 --no-browser
-        Affiche la telemetrie envoyee par mission_sortie_retour.py (UDP 5006)
-        sans ouvrir le GPS.
+    python3 ihm_lac.py --mission
+        Lance la mission D1 (aller vers D1, sortie de zone, tour complet,
+        retour par le couloir) et l'affiche sur http://<IP_BATEAU>:8000/.
+        Le journal de la mission est ecrit dans logs/ et telechargeable
+        sur http://<IP_BATEAU>:8000/journal.
 
 Commandes
 ---------
@@ -1554,64 +1556,17 @@ class LiveBoat(object):
 
 
 class MissionBoat(object):
-    """Telemetrie UDP envoyee par mission_sortie_retour.py.
+    """Adapte l'etat de MissionD1 (meme programme) au format de l'IHM.
 
-    La mission possede le GPS, les moteurs et l'IMU ; l'IHM se contente
-    d'ecouter. Cela evite d'ouvrir le GPS deux fois.
+    La mission possede le GPS, les moteurs et l'IMU ; l'IHM lit seulement
+    son etat en memoire, sans toucher au materiel.
     """
 
-    PHASES = {
-        "INIT": "Initialisation",
-        "ATTENTE_GPS": "Attente GPS",
-        "SORTIE": "Sortie de zone",
-        "HORS_LIMITES": "Hors limites detecte",
-        "TOUR": "Tour complet",
-        "RETOUR": "Retour a la base",
-        "ARRIVEE": "Base atteinte",
-        "ECHEC": "Echec",
-    }
-
-    def __init__(self, env, port=5006):
-        self.env = env
-        self.port = port
-        self.lock = threading.Lock()
-        self.stop = threading.Event()
-        self.paquet = None
-        self.recu = None
-        self.trail = deque(maxlen=800)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("0.0.0.0", port))
-        self.sock.settimeout(0.5)
-        self.thread = threading.Thread(target=self._ecouter, name="telemetrie-mission")
-        self.thread.daemon = True
-        self.thread.start()
-
-    def _ecouter(self):
-        while not self.stop.is_set():
-            try:
-                donnees, _ = self.sock.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            try:
-                paquet = json.loads(donnees.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if not isinstance(paquet, dict) or paquet.get("source") != "ddboat-mission":
-                continue
-            with self.lock:
-                self.paquet = paquet
-                self.recu = time.monotonic()
-                x, y = paquet.get("x"), paquet.get("y")
-                if x is not None and y is not None and (
-                        not self.trail or
-                        math.hypot(x - self.trail[-1][0], y - self.trail[-1][1]) >= 0.7):
-                    self.trail.append([float(x), float(y)])
+    def __init__(self, mission):
+        self.mission = mission
 
     def _texte(self, p):
-        morceaux = [self.PHASES.get(p.get("phase"), p.get("phase") or "?")]
+        morceaux = [p.get("phase_texte") or p.get("phase") or "?"]
         if p.get("dans_zone") is not None:
             morceaux.append("dans la zone" if p["dans_zone"] else "HORS LIMITES")
         if p.get("cap") is not None:
@@ -1626,29 +1581,16 @@ class MissionBoat(object):
         return " · ".join(morceaux)
 
     def get_state(self):
-        maintenant = time.monotonic()
-        with self.lock:
-            if self.paquet is None:
-                return {
-                    "boat": None,
-                    "trail": [],
-                    "age": None,
-                    "stale": True,
-                    "notice": "En attente de la mission (UDP {})".format(self.port),
-                }
-            p = dict(self.paquet)
-            age = maintenant - self.recu
-            trail = [[_arrondi(px, 1), _arrondi(py, 1)] for px, py in self.trail]
-
-        if p.get("fix_age") is not None:
-            age += float(p["fix_age"])
+        p = self.mission.etat()
         notice = self._texte(p)
+        trail = p.get("trail") or []
+        age = p.get("fix_age")
         if p.get("x") is None:
             return {"boat": None, "trail": trail, "age": None, "stale": True,
                     "notice": notice}
         return {
-            "x": float(p["x"]),
-            "y": float(p["y"]),
+            "x": p["x"],
+            "y": p["y"],
             "lat": p.get("lat"),
             "lon": p.get("lon"),
             "heading": p.get("heading") or 0.0,
@@ -1656,14 +1598,12 @@ class MissionBoat(object):
             "heading_source": "compas",
             "trail": trail,
             "age": age,
-            "stale": age > 3.0,
+            "stale": age is None or age > 3.0,
             "notice": notice,
         }
 
     def close(self):
-        self.stop.set()
-        self.thread.join(timeout=1.5)
-        self.sock.close()
+        pass
 
 
 class AppState(object):
@@ -1716,6 +1656,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     page = b""
     app_state = None
+    journal = None
 
     def do_GET(self):
         route = urlparse(self.path).path
@@ -1731,6 +1672,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._envoyer(500, "application/json; charset=utf-8", corps)
                 return
             self._envoyer(200, "application/json; charset=utf-8", corps)
+        elif route == "/journal" and self.journal is not None:
+            # Journal de la mission en cours, telechargeable depuis le PC.
+            try:
+                with open(str(self.journal), "rb") as fichier:
+                    corps = fichier.read()
+            except OSError as exc:
+                self._envoyer(404, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="{}"'.format(self.journal.name))
+            self.send_header("Content-Length", str(len(corps)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(corps)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif route == "/favicon.ico":
             self.send_response(204)
             self.send_header("Content-Length", "0")
@@ -1774,19 +1734,34 @@ def parser_arguments(argv=None):
         description="IHM de visualisation du Lac de Guerledan et du retour a la base.")
     parser.add_argument("--live", action="store_true",
                         help="lire la position GPS reelle au lieu de la simulation")
+    parser.add_argument("--mission", action="store_true",
+                        help="lancer la mission D1 (aller vers D1, tour complet, "
+                             "retour par le couloir) et l'afficher")
     parser.add_argument("--gps", type=int, choices=(0, 1, 2), default=0,
                         help="peripherique GPS : /dev/ttyGPS0, 1 ou 2 (defaut : 0)")
-    parser.add_argument("--mission", action="store_true",
-                        help="afficher la telemetrie de mission_sortie_retour.py")
-    parser.add_argument("--udp-port", type=int, default=5006,
-                        help="port UDP de la telemetrie de mission (defaut : 5006)")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="adresse d'ecoute (defaut : 127.0.0.1)")
+    parser.add_argument("--attente", type=float, default=10.0,
+                        help="mission : compte a rebours avant le depart en s "
+                             "(defaut : 10)")
+    parser.add_argument("--confirmations", type=int, default=3,
+                        help="mission : fix GPS hors limites successifs pour "
+                             "valider la sortie (defaut : 3)")
+    parser.add_argument("--rayon-arrivee", type=float, default=5.0,
+                        help="mission : distance a la base consideree atteinte "
+                             "en m (defaut : 5)")
+    parser.add_argument("--host", default=None,
+                        help="adresse d'ecoute (defaut : 127.0.0.1, "
+                             "0.0.0.0 avec --mission)")
     parser.add_argument("--port", type=int, default=8000,
                         help="port HTTP (defaut : 8000)")
     parser.add_argument("--no-browser", action="store_true",
                         help="ne pas ouvrir automatiquement le navigateur")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.host is None:
+        args.host = "0.0.0.0" if args.mission else "127.0.0.1"
+    if args.mission:
+        # Sur le bateau, il n'y a pas de navigateur a ouvrir.
+        args.no_browser = True
+    return args
 
 
 def main(argv=None):
@@ -1801,16 +1776,22 @@ def main(argv=None):
     mode = "demo"
     notice = "Simulation : trajectoire le long du gradient"
     bateau = None
+    mission = None
 
     if args.mission:
-        try:
-            bateau = MissionBoat(env, port=args.udp_port)
-            mode = "live"
-            notice = "Telemetrie de mission"
-            print("Ecoute de la telemetrie de mission sur le port UDP {}.".format(args.udp_port))
-        except OSError as exc:
-            print("Impossible d'ouvrir le port UDP {} : {}".format(args.udp_port, exc))
-            return 1
+        if str(BASE_DIR) not in sys.path:
+            sys.path.insert(0, str(BASE_DIR))
+        from mission_d1 import MissionD1
+        mission = MissionD1(env, {
+            "gps": args.gps,
+            "attente": args.attente,
+            "confirmations": args.confirmations,
+            "rayon_arrivee": args.rayon_arrivee,
+        })
+        bateau = MissionBoat(mission)
+        mode = "live"
+        notice = "Mission D1"
+        Handler.journal = mission.journal.chemin
     elif args.live:
         try:
             bateau = LiveBoat(env, gps_index=args.gps)
@@ -1850,7 +1831,12 @@ def main(argv=None):
         locale = adresse_locale()
         if locale:
             print("Depuis le reseau local : http://{}:{}/".format(locale, args.port))
-    print("Mode : {}".format("GPS temps reel" if mode == "live" else "simulation"))
+            if mission is not None:
+                print("Journal de mission : http://{}:{}/journal".format(locale, args.port))
+    if mission is not None:
+        print("Mode : mission D1")
+    else:
+        print("Mode : {}".format("GPS temps reel" if mode == "live" else "simulation"))
     print("Ctrl+C pour arreter.")
     print("")
     sys.stdout.flush()
@@ -1858,17 +1844,33 @@ def main(argv=None):
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
+    code = 0
     try:
-        serveur.serve_forever(poll_interval=0.5)
+        if mission is None:
+            serveur.serve_forever(poll_interval=0.5)
+        else:
+            # Le serveur tourne en arriere-plan ; la mission reste dans le
+            # thread principal pour que Ctrl+C coupe les moteurs.
+            fil = threading.Thread(target=serveur.serve_forever,
+                                   kwargs={"poll_interval": 0.5}, name="ihm")
+            fil.daemon = True
+            fil.start()
+            code = mission.executer()
+            print("L'IHM reste ouverte pour consulter la trace. Ctrl+C pour quitter.")
+            sys.stdout.flush()
+            while True:
+                time.sleep(1.0)
     except KeyboardInterrupt:
         print("\nArret de l'IHM.")
     finally:
+        if mission is not None:
+            serveur.shutdown()
         serveur.server_close()
         try:
             bateau.close()
         except Exception:
             pass
-    return 0
+    return code
 
 
 if __name__ == "__main__":
