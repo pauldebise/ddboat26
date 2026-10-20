@@ -9,7 +9,6 @@ import numpy as np
 def gradient_artificiel_point(x_pt: float, y_pt: float, x_pos: float, y_pos: float, attract: bool):
     signe = (-1) if attract else 1
     return signe * np.array([x_pos-x_pt, y_pos-y_pt])
-    
 
 def gradient_artificiel_ligne(x_n: float, y_n: float, x_pt: float, y_pt: float, x_pos: float, y_pos: float):
     n = np.array([x_n, y_n])
