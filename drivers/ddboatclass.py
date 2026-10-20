@@ -183,7 +183,42 @@ class DDBoat:
             # exception survient pendant la rotation.
             self._arreter_moteurs()
 
-    def get_cart_position(self, origin, angle_rotation=0.0):
+    def convert_cart_position(self, lat, long, origin, angle_rotation=0.0):
+        """Fait convertir la position dans le repère local du Lac"""
+
+        lat_orig, lon_orig = origin[0], origin[1]
+
+        # Rayon moyen de la Terre en mètres
+        R = 6371000.0
+
+        # 1. Conversion des coordonnées en radians
+        lat_rad = math.radians(lat)
+        lon_rad = math.radians(long)
+        lat_orig_rad = math.radians(lat_orig)
+        lon_orig_rad = math.radians(lon_orig)
+
+        # 2. Calcul des distances en mètres (Repère Est / Nord brut)
+        # dy = distance vers le Nord
+        dy = (lat_rad - lat_orig_rad) * R
+        # dx = distance vers l'Est (pondérée par le cosinus de la latitude)
+        dx = (lon_rad - lon_orig_rad) * R * math.cos(lat_orig_rad)
+
+        # 3. Application d'une rotation si votre repère local est orienté
+        # (Par exemple si l'axe X de votre lac n'est pas strictement orienté vers l'Est géographique)
+        if angle_rotation != 0.0:
+            x_rot = dx * math.cos(angle_rotation) + dy * math.sin(angle_rotation)
+            y_rot = -dx * math.sin(angle_rotation) + dy * math.cos(angle_rotation)
+            return x_rot, y_rot
+
+        return dx, dy
+
+
+
+
+
+
+
+    def get_DDboat_cart_position(self, origin, angle_rotation=0.0):
         """Convertit la position GPS actuelle (lat, long)
 
         en coordonnées cartésiennes locales (x, y en mètres) par rapport à l'origine.
@@ -244,6 +279,16 @@ class DDBoat:
             speed_right = 191
 
         self.ard.set_motor_speeds(speed_left, speed_right)
+
+    def homing(self, Environnement):
+
+
+        if Environnement.lim() == 1:
+            while True:
+                if self.gps.
+                    self.maintien_cap(Environnement.direction()):
+                else:
+                    break
 
 
 
