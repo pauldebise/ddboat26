@@ -332,5 +332,8 @@ if __name__ == "__main__":
     ddb = DDBoat(ard, gps, imu)
     
     lac = Environnement()
-    ddb.homing(lac)
+    x, y = ddb.get_DDboat_cart_position(lac.home_latlong)
+    if not lac.lim(x, y):
+        ddb.tour_complet()
+        ddb.homing(lac)
     print("Fini!")
