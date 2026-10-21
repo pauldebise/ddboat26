@@ -174,9 +174,14 @@ class DDBoat:
     # (0-255) par radian d'erreur, ou par radian.seconde, ou par rad/s.
     # Le journal de la mission du 20/10 montrait un ecart de cap permanent de
     # 12 a 25 deg avec Kp = 25 sous le vent : le terme integral le supprime.
-    KP_CAP = 80.0
-    KI_CAP = 12.0
-    KD_CAP = 22.0                       # amortissement sur la vitesse de rotation
+    # Les essais du 21/10 ont montre qu'avec Kp = 80 le bateau oscille (period
+    # 1,3 s, +-25 deg) quand il reagit fort aux moteurs : le compas ne
+    # fournit que 10 mesures/s et la commande arrive ~0,25 s en retard.
+    # Kp = 45 / Ki = 10 / Kd = 16 reste stable sur toute la plage de bateaux
+    # plausibles (simulation) et tourne de 90 deg en 5 s.
+    KP_CAP = 45.0
+    KI_CAP = 10.0
+    KD_CAP = 16.0                       # amortissement sur la vitesse de rotation
     LIMITE_INTEGRALE = 40.0             # correction integrale maximale (commande)
     LIMITE_DERIVEE = 30.0
     ZONE_INTEGRALE = math.radians(45.0)  # pas d'integration au-dela de cet ecart
@@ -184,6 +189,16 @@ class DDBoat:
     TAU_DERIVEE = 0.4                   # filtre de la vitesse de rotation (s)
     VITESSE_CROISIERE = 150             # commande moteur moyenne en route
     COMMANDE_MAX = 191
+    # Au-dela de ANGLE_VIRAGE_PLEIN d'ecart, la vitesse d'avance diminue ; a
+    # ANGLE_PIVOT elle est nulle : le bateau pivote sur place (un moteur en
+    # marche arriere, jusqu'a COMMANDE_INVERSE) au lieu de decrire un grand
+    # cercle, ce qui evite de deriver vers un ponton pendant un demi-tour.
+    ANGLE_VIRAGE_PLEIN = math.radians(35.0)
+    ANGLE_PIVOT = math.radians(90.0)
+    COMMANDE_INVERSE = 100
+    # Le compas lit 4 deg de trop (calibration du 21/10, ajuste sur le GPS) :
+    # cap vrai = cap mesure + BIAIS_COMPAS.
+    BIAIS_COMPAS = math.radians(-4.0)
     # Compensation de la derive (vent, courant) par un cap de « crabe ».
     COMPENSATION_DERIVE = True
 
@@ -233,7 +248,8 @@ class DDBoat:
         self.derniere_commande = (0, 0)
         self.derniere_route = None
         self.dernier_asservissement = {}
-        self._reg = {"i": 0.0, "rotation": 0.0, "cap": None, "t": None}
+        self._reg = {"i": 0.0, "rotation": 0.0, "cap_mes": None, "t": None,
+                     "cap_t": None}
 
     def _journaliser(self, type_evenement, **donnees):
         """Transmet un evenement au journal, sans jamais bloquer le bateau."""
@@ -282,7 +298,7 @@ class DDBoat:
         self.dernier_mag_brut = (xmag, ymag, zmag)
         heading_rad = compute_heading([xmag, ymag, zmag], self.invA, self.xbar)
         # Cap boussole : 0 = Nord, croissant dans le sens horaire.
-        self.dernier_cap = heading_rad % (2 * math.pi)
+        self.dernier_cap = (heading_rad + self.BIAIS_COMPAS) % (2 * math.pi)
         with self._verrou_cap:
             self._acc_cap[0] += math.sin(self.dernier_cap)
             self._acc_cap[1] += math.cos(self.dernier_cap)
@@ -598,7 +614,8 @@ class DDBoat:
 
     def reinitialiser_asservissement(self):
         """Remet a zero l'integrale et la derivee du regulateur de cap."""
-        self._reg = {"i": 0.0, "rotation": 0.0, "cap": None, "t": None}
+        self._reg = {"i": 0.0, "rotation": 0.0, "cap_mes": None, "t": None,
+                     "cap_t": None}
 
     def _regulateur_cap(self, erreur, cap):
         """Regulateur PID de l'ecart de cap (rad). Retourne (u, detail).
@@ -622,12 +639,21 @@ class DDBoat:
                 reg["i"] = 0.0
                 reg["rotation"] = 0.0
                 dt = None
-        if dt is not None and reg["cap"] is not None:
-            vitesse = angle_diff(cap, reg["cap"]) / dt
-            alpha = dt / (self.TAU_DERIVEE + dt)
+        # Le compas ne produit qu'une mesure toutes les ~0,1 s : la boucle
+        # (18 Hz) relit souvent la meme valeur. La vitesse de rotation n'est
+        # mise a jour que sur une mesure nouvelle (sinon elle oscille entre 0
+        # et le double de sa valeur).
+        if reg["cap_mes"] is None or dt is None:
+            reg["cap_mes"] = cap
+            reg["cap_t"] = maintenant
+        elif cap != reg["cap_mes"]:
+            ecart_t = max(maintenant - reg["cap_t"], 0.09)
+            vitesse = angle_diff(cap, reg["cap_mes"]) / ecart_t
+            alpha = ecart_t / (self.TAU_DERIVEE + ecart_t)
             reg["rotation"] += (vitesse - reg["rotation"]) * alpha
+            reg["cap_mes"] = cap
+            reg["cap_t"] = maintenant
         reg["t"] = maintenant
-        reg["cap"] = cap
 
         u_p = self.KP_CAP * erreur
         if dt is not None and abs(erreur) >= self.ZONE_INTEGRALE:
@@ -660,12 +686,12 @@ class DDBoat:
         if exces > 0:
             gauche -= exces
             droite -= exces
-        manque = -min(gauche, droite)
+        manque = -self.COMMANDE_INVERSE - min(gauche, droite)
         if manque > 0:
             gauche += manque
             droite += manque
-        gauche = max(0.0, min(self.COMMANDE_MAX, gauche))
-        droite = max(0.0, min(self.COMMANDE_MAX, droite))
+        gauche = max(-self.COMMANDE_INVERSE, min(self.COMMANDE_MAX, gauche))
+        droite = max(-self.COMMANDE_INVERSE, min(self.COMMANDE_MAX, droite))
         return gauche, droite
 
     def suivre_route(self, route, derive=None, vitesse=None):
@@ -693,7 +719,12 @@ class DDBoat:
 
         erreur = angle_diff(cap_commande, current_cap)
         u, detail = self._regulateur_cap(erreur, current_cap)
-        gauche, droite = self._melanger(u, vitesse)
+        # Grand ecart de cap : on ralentit, jusqu'a pivoter sur place.
+        facteur = 1.0 - (abs(erreur) - self.ANGLE_VIRAGE_PLEIN) / (
+            self.ANGLE_PIVOT - self.ANGLE_VIRAGE_PLEIN)
+        facteur = max(0.0, min(1.0, facteur))
+        detail["facteur_vitesse"] = facteur
+        gauche, droite = self._melanger(u, vitesse * facteur)
         self._commander_moteurs(gauche, droite)
 
         detail.update({

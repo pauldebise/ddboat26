@@ -45,6 +45,7 @@ class EstimateurDerive(object):
     COMMANDE_MIN = 80.0           # bateau propulse (sinon la mesure ne dit rien)
     POIDS_VITESSE = 1.0           # force de l'a priori sur s
     POIDS_DERIVE = 0.3            # force de l'a priori w = 0
+    SEUIL_ABERRANT = 0.35         # m/s : au-dela, une mesure compte de moins en moins
     CRAB_MAX = math.radians(50.0)
 
     def __init__(self):
@@ -105,9 +106,19 @@ class EstimateurDerive(object):
             b_ridge = np.array([ls * self.VITESSE_NOMINALE, 0.0, 0.0])
             a_tot = np.vstack([a * w[:, None], a_ridge])
             b_tot = np.concatenate([b * w, b_ridge])
-            # Equations normales : bien conditionnees grace a l'a priori.
-            solution = np.linalg.solve(a_tot.T.dot(a_tot), a_tot.T.dot(b_tot))
-            residu = a.dot(solution) - b
+            # Regression robuste (Huber, quelques iterations) : une mesure
+            # aberrante (bateau pris a la main, choc, rafale) est ecartee au
+            # lieu de fausser l'estimation pendant 25 s.
+            poids_robuste = np.ones(len(a))
+            for _ in range(4):
+                pr = np.concatenate([poids_robuste, np.ones(3)])
+                a_p = a_tot * pr[:, None]
+                solution = np.linalg.solve(a_tot.T.dot(a_p), a_p.T.dot(b_tot))
+                residu = a.dot(solution) - b
+                # Norme du residu de chaque mesure (deux lignes : est, nord).
+                norme = np.hypot(residu[0::2], residu[1::2])
+                poids_mesure = np.minimum(1.0, self.SEUIL_ABERRANT / np.maximum(norme, 1e-9))
+                poids_robuste = np.repeat(poids_mesure, 2)
             derniere = {
                 "s": float(min(3.0, max(0.3, solution[0]))),
                 "est": float(solution[1]),
