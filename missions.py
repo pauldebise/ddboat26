@@ -13,7 +13,8 @@ Mission :
 
 - polygone    : parcourt un polygone defini dans polygone.json, avec le
                 gradient de ligne (segment courant) et le gradient ponctuel
-                (sommet vise).
+                (sommet vise) ;
+- mission3, stationkeeping : voir leurs classes.
 
 Chaque mission ecrit son journal dans logs/ (voir session.py). Les essais
 logguent en plus un evenement de bilan par cap ou par segment.
@@ -423,7 +424,244 @@ class Mission3(MissionPolygone):
         super(Mission3, self).__init__(session, parametres)
 
 
-MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone, Mission3]
+# ----------------------------------------------------------------------
+# Station keeping
+# ----------------------------------------------------------------------
+class _SuiviGel(object):
+    """Repere un GPS fige : meme position sur plusieurs fix consecutifs.
+
+    Quand le bateau va lentement, le GPS cesse de reporter le bruit et repete
+    la meme position (voir drivers/gps_driver_v2.py) : la position n'est plus
+    a jour tant que le bateau n'a pas repris de la vitesse.
+    """
+
+    IDENTIQUES_MIN = 2   # fix identiques consecutifs a partir desquels le GPS est fige
+
+    def __init__(self, ddb):
+        self.ddb = ddb
+        self.compteur = ddb.compteur_fix_gps
+        self.position = ddb.derniere_position_gps
+        self.identiques = 0
+
+    def mettre_a_jour(self):
+        """A appeler a chaque tour de boucle."""
+        ddb = self.ddb
+        if ddb.compteur_fix_gps != self.compteur:
+            self.compteur = ddb.compteur_fix_gps
+            if ddb.derniere_position_gps == self.position:
+                self.identiques += 1
+            else:
+                self.position = ddb.derniere_position_gps
+                self.identiques = 0
+
+    @property
+    def fige(self):
+        return self.identiques >= self.IDENTIQUES_MIN
+
+
+class StationKeeping(_MissionNavigation):
+    NOM = "stationkeeping"
+    TITRE = "Station keeping (point G)"
+    DESCRIPTION = ("Reste autour d'un point (G par defaut), sans fin. Dans la grande "
+                   "zone, les moteurs sont coupes (position relue chaque seconde). "
+                   "Si le bateau en sort, il rejoint la petite zone en ralentissant, "
+                   "sans jamais marche arriere, puis coupe les moteurs. Arret par "
+                   "le bouton Arret.")
+    PARAMETRES = [
+        _param("lat", "Latitude du point (deg)", 48.198944),
+        _param("lon", "Longitude du point (deg)", -3.015478),
+        _param("rayon_grande", "Rayon de la grande zone (m)", 5.0),
+        _param("rayon_petite", "Rayon de la petite zone (m)", 2.0),
+        _param("vitesse", "Vitesse de ralliement (commande moteur)", 100, type="entier"),
+        _param("vitesse_fin", "Vitesse a l'entree de la petite zone", 70, type="entier"),
+        _param("ralentir", "Ralentir sur les derniers (m)", 6.0),
+        _param("derive", "Compensation de derive", "non", type="choix",
+               choix=CHOIX_OUI_NON),
+        _param("duree", "Duree (s, 0 = sans fin)", 0.0),
+        _param("attente", "Compte a rebours (s)", 10.0),
+    ]
+    PERIODE_VEILLE = 1.0   # relecture de la position dans la grande zone (s)
+    # Commande maximale d'un moteur pendant le ralliement, par rapport a la
+    # vitesse demandee : borne la poussee du moteur qui fait tourner le bateau.
+    MARGE_PLAFOND = 1.25
+    # Renfort de poussee (commande par seconde) quand le GPS est fige, et
+    # decroissance quand il bouge de nouveau.
+    RENFORT_GEL = 10.0
+    RELACHE_GEL = 4.0
+    GEL_MAX = 4.0     # poussee maximale a l'aveugle avec le GPS fige (s)
+    PAUSE_GEL = 5.0   # pause moteurs coupes avant de reessayer (s)
+    fin = None   # instant de fin (time.monotonic()), None = sans fin
+
+    def _rallier(self, cible, suivi, derive):
+        """Rejoint la petite zone. Retourne "arrivee", "gel" ou "fin" (duree ecoulee)."""
+        s, ddb, p = self.s, self.ddb, self.p
+        s.definir_phase("RALLIEMENT", "retour dans la petite zone")
+        ddb.reinitialiser_asservissement()
+        precedent = time.monotonic()
+        gps_perime = False
+        # Si le GPS est fige alors que les moteurs poussent, le bateau va trop
+        # lentement pour que le GPS le voie : on pousse un peu plus jusqu'a ce
+        # que la position bouge, au lieu de piloter sur une position perimee.
+        renfort = 0.0
+        duree_gel = 0.0
+        while True:
+            s.verifier_arret()
+            maintenant = time.monotonic()
+            dt = maintenant - precedent
+            precedent = maintenant
+            if self.fin is not None and maintenant >= self.fin:
+                ddb._arreter_moteurs()
+                return "fin"
+            position, age = s.position_fraiche()
+            if position is None:
+                ddb._arreter_moteurs()
+                if not gps_perime:
+                    s.ecrire_journal("gps_perime", {"age": age})
+                    s.definir_message("GPS perdu, moteurs coupes")
+                    gps_perime = True
+                time.sleep(0.2)
+                continue
+            if gps_perime:
+                s.ecrire_journal("gps_retabli", {"age": age})
+                gps_perime = False
+            suivi.mettre_a_jour()
+            dist = float(np.linalg.norm(position - cible))
+            if dist <= p["rayon_petite"]:
+                ddb._arreter_moteurs()
+                return "arrivee"
+            if suivi.fige:
+                renfort += self.RENFORT_GEL * dt
+                duree_gel += dt
+                if duree_gel >= self.GEL_MAX:
+                    # Le renfort n'a pas suffi : on ne pousse pas a l'aveugle.
+                    ddb._arreter_moteurs()
+                    return "gel"
+            else:
+                renfort = max(0.0, renfort - self.RELACHE_GEL * dt)
+                duree_gel = 0.0
+            restant = (dist - p["rayon_petite"]) / max(p["ralentir"], 0.1)
+            vitesse = p["vitesse_fin"] + (p["vitesse"] - p["vitesse_fin"]) * max(
+                0.0, min(1.0, restant))
+            vitesse = min(p["vitesse"], vitesse + renfort)
+            cap_cible, cap, gauche, droite = ddb.maintien_cap(
+                cible - position, self.env.rotation, derive=derive, vitesse=vitesse)
+            sol = ddb.vitesse_sol or {}
+            s.ecrire_journal("nav", dict({
+                "mission": self.NOM, "etat": "ralliement",
+                "x": position[0], "y": position[1], "age": age, "dt": dt,
+                "dist": dist, "gel": suivi.identiques, "renfort": renfort,
+                "vitesse_voulue": vitesse,
+                "cap_cible": math.degrees(cap_cible), "cap": math.degrees(cap),
+                "erreur": math.degrees(angle_diff(cap_cible, cap)),
+                "moteurs": (gauche, droite), "mag": ddb.dernier_mag_brut,
+                "v_sol": sol.get("vitesse"), "cog": sol.get("cog"),
+            }, **ddb.dernier_asservissement))
+            s.definir_guidage(dist_cible=dist)
+            s.definir_message("{:.1f} m du point, vitesse {:.0f}{}".format(
+                dist, vitesse, ", GPS fige" if suivi.fige else ""))
+            time.sleep(0.05)
+
+    def executer(self):
+        s, ddb, p = self.s, self.ddb, self.p
+        if not (0.0 < p["rayon_petite"] < p["rayon_grande"]):
+            s.definir_phase("ECHEC", "il faut 0 < petite zone < grande zone")
+            return 1, "parametres"
+        if not (0 < p["vitesse_fin"] <= p["vitesse"]):
+            s.definir_phase("ECHEC", "il faut 0 < vitesse a l'entree <= vitesse")
+            return 1, "parametres"
+        cible = np.array(s.convertisseur.convert_cart_position(
+            p["lat"], p["lon"], self.env.home_latlong, self.env.rotation), dtype=float)
+        depart = self._preparer_depart(p["attente"])
+        if depart is None:
+            return 1, "pas_de_gps"
+        derive = p["derive"] == "oui"
+        s.ecrire_journal("stationkeeping", {
+            "lat": p["lat"], "lon": p["lon"], "cible": cible,
+            "rayon_grande": p["rayon_grande"], "rayon_petite": p["rayon_petite"],
+            "dist_depart": float(np.linalg.norm(depart - cible))})
+        s.definir_guidage(b=[float(cible[0]), float(cible[1])],
+                          zones=[p["rayon_petite"], p["rayon_grande"]],
+                          derive=derive)
+        debut = time.monotonic()
+        self.fin = debut + p["duree"] if p["duree"] > 0.0 else None
+        suivi = _SuiviGel(ddb)
+        bilan = {"sorties": 0, "duree_veille": 0.0, "duree_ralliement": 0.0,
+                 "dist_max": 0.0}
+
+        # Pas de marche arriere (un moteur au plus arrete pour tourner) et
+        # poussee bornee : valeurs posees sur l'objet, sans toucher a la classe.
+        ddb.COMMANDE_INVERSE = 0
+        ddb.COMMANDE_MAX = int(round(self.MARGE_PLAFOND * p["vitesse"]))
+        try:
+            while self.fin is None or time.monotonic() < self.fin:
+                s.verifier_arret()
+                position, age = s.position_fraiche()
+                if position is None:
+                    ddb._arreter_moteurs()
+                    s.ecrire_journal("gps_perime", {"age": age})
+                    s.definir_message("GPS perdu, moteurs coupes")
+                    s.pause(self.PERIODE_VEILLE)
+                    continue
+                suivi.mettre_a_jour()
+                dist = float(np.linalg.norm(position - cible))
+                bilan["dist_max"] = max(bilan["dist_max"], dist)
+                if dist <= p["rayon_grande"]:
+                    self._veiller(position, age, dist, suivi, bilan)
+                    continue
+                bilan["sorties"] += 1
+                s.ecrire_journal("sortie_grande_zone", {
+                    "x": position[0], "y": position[1], "dist": dist,
+                    "sorties": bilan["sorties"], "gel": suivi.identiques})
+                debut_ralliement = time.monotonic()
+                arrivee = self._rallier(cible, suivi, derive)
+                bilan["duree_ralliement"] += time.monotonic() - debut_ralliement
+                position, _ = s.position_fraiche()
+                s.ecrire_journal("fin_ralliement", {
+                    "issue": arrivee,
+                    "duree": time.monotonic() - debut_ralliement,
+                    "x": position[0] if position is not None else None,
+                    "y": position[1] if position is not None else None,
+                    "dist": (float(np.linalg.norm(position - cible))
+                             if position is not None else None)})
+                if arrivee == "gel":
+                    s.definir_message("GPS fige, moteurs coupes")
+                    s.pause(self.PAUSE_GEL)
+        finally:
+            for nom in ("COMMANDE_INVERSE", "COMMANDE_MAX"):
+                ddb.__dict__.pop(nom, None)
+            try:
+                ddb._arreter_moteurs()
+            except Exception:
+                pass
+            bilan["duree"] = time.monotonic() - debut
+            s.ecrire_journal("bilan", bilan)
+            s.definir_guidage()
+        s.definir_phase("TERMINE", "station keeping termine")
+        return 0, "termine"
+
+    def _veiller(self, position, age, dist, suivi, bilan):
+        """Dans la grande zone : moteurs coupes, position relue chaque seconde."""
+        s, ddb, p = self.s, self.ddb, self.p
+        debut = time.monotonic()
+        ddb._arreter_moteurs()
+        cap = ddb.current_cap_rad()
+        if s.phase != "MAINTIEN":
+            s.definir_phase("MAINTIEN", "dans la grande zone")
+        s.definir_message("a {:.1f} m du point{}".format(
+            dist, ", GPS fige" if suivi.fige else ""))
+        s.definir_guidage(dist_cible=dist)
+        sol = ddb.vitesse_sol or {}
+        s.ecrire_journal("station", {
+            "x": position[0], "y": position[1], "age": age, "dist": dist,
+            "dans_petite": bool(dist <= p["rayon_petite"]),
+            "gel": suivi.identiques, "cap": math.degrees(cap),
+            "v_sol": sol.get("vitesse")})
+        s.pause(self.PERIODE_VEILLE)
+        bilan["duree_veille"] += time.monotonic() - debut
+
+
+MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone, Mission3,
+            StationKeeping]
 
 
 def enregistrer_missions(session):

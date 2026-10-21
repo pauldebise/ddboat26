@@ -66,7 +66,7 @@ class MondeSimule(object):
                  bruit_compas=1.2, bruit_gps=0.15, couple=4.0,
                  direction_couple=180.0, sens_physique=1, graine=1,
                  retard_commande=0.25, periode_compas=0.097, gain_rotation=0.5,
-                 tau_rotation=0.5):
+                 tau_rotation=0.5, gel_vitesse=0.0):
         self.origine = (float(origine[0]), float(origine[1]))
         self.rotation = float(rotation)
         self.verrou = threading.RLock()
@@ -95,6 +95,10 @@ class MondeSimule(object):
         self.compas = None                # (instant de l'echantillon, valeur)
         self.amarre = True
         self.erreur_gps = [0.0, 0.0]
+        # Comme le GPS du bateau : sous cette vitesse sol (m/s), la position
+        # reste figee jusqu'a ce que le bateau reparte (0 = pas de gel).
+        self.gel_vitesse = float(gel_vitesse)
+        self.derniere_mesure = None
         self.t = time.monotonic()
         self.trace = []
 
@@ -167,8 +171,18 @@ class MondeSimule(object):
             for i in (0, 1):
                 self.erreur_gps[i] = (0.9 * self.erreur_gps[i]
                                       + self.hasard.gauss(0.0, self.bruit_gps))
-            est = self.est + self.erreur_gps[0]
-            nord = self.nord + self.erreur_gps[1]
+            if self.amarre:
+                ve = vn = 0.0
+            else:
+                ve = self.vitesse * math.sin(self.cap) + self.vent[0]
+                vn = self.vitesse * math.cos(self.cap) + self.vent[1]
+            if (self.gel_vitesse > 0.0 and self.derniere_mesure is not None
+                    and math.hypot(ve, vn) < self.gel_vitesse):
+                est, nord = self.derniere_mesure
+            else:
+                est = self.est + self.erreur_gps[0]
+                nord = self.nord + self.erreur_gps[1]
+                self.derniere_mesure = (est, nord)
         lat0 = self.origine[0]
         lat = lat0 + math.degrees(nord / R_TERRE)
         lon = self.origine[1] + math.degrees(est / (R_TERRE * math.cos(math.radians(lat0))))

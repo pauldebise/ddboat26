@@ -213,6 +213,8 @@ class Session(object):
         "ARRIVEE": "Base atteinte",
         "ESSAI": "Essai en cours",
         "NAVIGATION": "Navigation",
+        "MAINTIEN": "Maintien de position",
+        "RALLIEMENT": "Retour dans la zone",
         "TERMINE": "Mission terminee",
         "ECHEC": "Echec",
         "ARRET": "Arret",

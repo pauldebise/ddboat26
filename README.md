@@ -26,6 +26,7 @@ aussi les moteurs.
 | Essai 3 : ralliement d'un point | Gradient ponctuel seul, comme le homing |
 | Mission : polygone | Parcourt le polygone de `polygone.json` (gradient de ligne + gradient ponctuel) |
 | Mission 3 | Trajet A-C-D-G'-E-F-G-A de `mission3.json`, termine à A en ralentissant pour s'arrêter avant le ponton |
+| Station keeping | Reste autour du point G, sans fin : moteurs coupés dans la grande zone (5 m), retour lent sans marche arrière dans la petite (2 m) |
 | Mission D1 | Aller vers D1, tour complet, retour par le couloir |
 
 Le polygone se décrit dans `polygone.json` (voir `polygone.exemple.json`),

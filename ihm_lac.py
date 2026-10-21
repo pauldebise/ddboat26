@@ -942,6 +942,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     }
     if (actif && g && g.b) {
       c.save();
+      if (g.zones) {
+        for (var z = 0; z < g.zones.length; z++) {
+          c.beginPath();
+          c.arc(sx(g.b[0]), sy(g.b[1]), Math.abs(sx(g.b[0] + g.zones[z]) - sx(g.b[0])), 0, Math.PI * 2);
+          c.setLineDash([6, 4]);
+          c.strokeStyle = z === 0 ? 'rgba(53,102,155,0.9)' : 'rgba(191,122,33,0.85)';
+          c.lineWidth = 1.6;
+          c.stroke();
+        }
+        c.setLineDash([]);
+      }
       if (g.a) {
         c.beginPath();
         c.moveTo(sx(g.a[0]), sy(g.a[1]));
