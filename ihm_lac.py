@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""IHM minimaliste : lac, bateau, points de bordure et champ de gradient.
+"""IHM du lac : visualisation, essais de reglage et missions du bateau.
 
 L'interface s'ouvre dans un navigateur (locale ou distante) et affiche :
 
 - le plan d'eau du Lac de Guerledan dans le repere local de la base ;
 - les six points du couloir et des bordures ;
 - la position du bateau (simulation ou GPS) ;
-- le champ de gradient calcule par Environnement.direction().
+- le champ de gradient calcule par Environnement.direction() ;
+- avec --bateau ou --mission : le panneau Missions (lancement, arret,
+  chemin prevu, segment suivi, ecart lateral, derive estimee).
 
 Usages
 ------
@@ -21,11 +23,24 @@ Usages
     python3 ihm_lac.py --live --gps 1 --host 0.0.0.0 --port 8080
         GPS sur /dev/ttyGPS1, interface accessible depuis le reseau local.
 
-    python3 ihm_lac.py --mission
-        Lance la mission D1 (aller vers D1, sortie de zone, tour complet,
-        retour par le couloir) et l'affiche sur http://<IP_BATEAU>:8000/.
-        Le journal de la mission est ecrit dans logs/ et telechargeable
-        sur http://<IP_BATEAU>:8000/journal.
+    python3 ihm_lac.py --bateau
+        Sur le bateau : ouvre Arduino, GPS et compas, puis attend les essais
+        et missions lances depuis la page (panneau Missions) :
+        http://<IP_BATEAU>:8000/. Le bouton ARRET coupe les moteurs.
+
+    python3 ihm_lac.py --mission d1 --param attente=5
+        Comme --bateau, mais lance tout de suite la mission indiquee
+        (d1, cap, segment, point, polygone). Les autres restent lancables
+        depuis la page ensuite.
+
+    python3 ihm_lac.py --bateau --simulation --acceleration 5
+        Meme programme avec un bateau simule (vent, moteurs inegaux, compas
+        biaise) : permet d'essayer l'IHM et les missions sans materiel.
+
+Journaux
+--------
+Chaque mission ecrit logs/<mission>_AAAAMMJJ_HHMMSS.jsonl (logs/simulation/
+en simulation), telechargeable sur http://<IP_BATEAU>:8000/journal.
 
 Commandes
 ---------
@@ -52,7 +67,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DRIVERS_DIR = BASE_DIR / "drivers"
@@ -269,6 +284,45 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   @keyframes hint {
     0% { opacity: 0; } 8% { opacity: 1; } 78% { opacity: 1; } 100% { opacity: 0; }
   }
+  .mission {
+    right: 18px; top: 16px; width: 276px; padding: 12px 13px 11px;
+    max-height: calc(100% - 150px); overflow-y: auto;
+    pointer-events: auto; display: none; z-index: 8;
+  }
+  .mission-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    font-size: 9px; font-weight: 600; letter-spacing: .095em; text-transform: uppercase;
+    margin-bottom: 7px;
+  }
+  .mission-etat { font-weight: 600; letter-spacing: .04em; text-transform: none; font-size: 10px; color: var(--muted); }
+  .mission-etat.en_cours, .mission-etat.demandee { color: var(--green); }
+  .mission-etat.echec, .mission-etat.arretee { color: #a13a28; }
+  .mission select, .mission input[type=text] {
+    width: 100%; font-family: var(--sans); font-size: 11px; color: var(--ink);
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 7px;
+    background: rgba(255,255,255,.8);
+  }
+  .mission select:disabled, .mission input:disabled { opacity: .55; }
+  .mission-desc { margin: 7px 0 4px; font-size: 9.5px; line-height: 1.4; color: var(--muted); }
+  .mission-params { display: grid; grid-template-columns: 1fr 78px; gap: 5px 8px; align-items: center; margin-top: 6px; }
+  .mission-params label { font-size: 9.5px; color: #3c504f; line-height: 1.25; }
+  .mission-params input, .mission-params select { padding: 3px 5px; font-size: 10.5px; }
+  .mission-btns { display: flex; gap: 8px; margin-top: 11px; }
+  .mission-btns button {
+    flex: 1; height: 32px; border-radius: 8px; border: 1px solid var(--line);
+    font-family: var(--sans); font-size: 11px; font-weight: 700; letter-spacing: .05em;
+    cursor: pointer; color: #fff;
+  }
+  .mission-btns .go { background: var(--green); }
+  .mission-btns .stop { background: #b3392a; }
+  .mission-btns button:disabled { opacity: .35; cursor: default; }
+  .mission-statut {
+    margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: 9.3px; line-height: 1.5; color: #3c504f;
+    white-space: pre-line;
+  }
+  .mission-statut:empty { display: none; }
+  .mission-journal { display: none; margin-top: 7px; font-size: 9.5px; color: var(--blue); }
   @media (max-width: 980px) {
     .legend { display: none; }
     .inset { width: 168px; }
@@ -288,6 +342,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .controls { right: 10px; bottom: 10px; }
     .control-card { gap: 7px; padding: 5px 7px; }
     .hint { display: none; }
+    .mission { width: 218px; right: 10px; top: 10px; }
   }
 </style>
 </head>
@@ -354,6 +409,19 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="card mission" id="missionCard">
+    <div class="mission-head">Missions <span id="missionEtat" class="mission-etat">en attente</span></div>
+    <select id="missionSel"></select>
+    <div id="missionDesc" class="mission-desc"></div>
+    <div id="missionParams" class="mission-params"></div>
+    <div class="mission-btns">
+      <button id="btnLancer" type="button" class="go">LANCER</button>
+      <button id="btnStop" type="button" class="stop">ARRÊT</button>
+    </div>
+    <div id="missionStatut" class="mission-statut"></div>
+    <a id="missionJournal" class="mission-journal" href="/journal" target="_blank">Télécharger le journal</a>
+  </div>
+
   <div class="hint">Molette pour zoomer &middot; glisser pour déplacer</div>
 </main>
 
@@ -377,6 +445,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   var dirty = true;
   var state = null;
   var smooth = null;
+  var apercu = null;
   var showField = true;
   var showTrail = true;
   var lastStateAt = 0;
@@ -842,6 +911,54 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     c.restore();
   }
 
+  function drawMission(c) {
+    if (!state) return;
+    var m = state.mission || {};
+    var actif = m.etat === 'en_cours' || m.etat === 'demandee';
+    var g = state.guidage || null;
+    var chemin = actif ? (g && g.chemin) : apercu;
+    if (chemin && chemin.length > 1) {
+      c.save();
+      c.beginPath();
+      for (var i = 0; i < chemin.length; i++) {
+        var X = sx(chemin[i][0]), Y = sy(chemin[i][1]);
+        if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+      }
+      c.setLineDash([7, 5]);
+      c.strokeStyle = 'rgba(191,122,33,0.85)';
+      c.lineWidth = 1.6;
+      c.stroke();
+      c.setLineDash([]);
+      c.fillStyle = '#fff';
+      c.strokeStyle = COL.amber;
+      c.lineWidth = 1.6;
+      for (var k = 0; k < chemin.length; k++) {
+        c.beginPath();
+        c.arc(sx(chemin[k][0]), sy(chemin[k][1]), 4, 0, Math.PI * 2);
+        c.fill();
+        c.stroke();
+      }
+      c.restore();
+    }
+    if (actif && g && g.b) {
+      c.save();
+      if (g.a) {
+        c.beginPath();
+        c.moveTo(sx(g.a[0]), sy(g.a[1]));
+        c.lineTo(sx(g.b[0]), sy(g.b[1]));
+        c.strokeStyle = 'rgba(53,102,155,0.9)';
+        c.lineWidth = 2.4;
+        c.stroke();
+      }
+      c.beginPath();
+      c.arc(sx(g.b[0]), sy(g.b[1]), 9, 0, Math.PI * 2);
+      c.strokeStyle = COL.base;
+      c.lineWidth = 2;
+      c.stroke();
+      c.restore();
+    }
+  }
+
   function drawGradientArrow(c, x, y, ux, uy) {
     var ax = x + ux * 12, ay = y + uy * 12;
     var bx = x + ux * 34, by = y + uy * 34;
@@ -929,6 +1046,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(staticLayer, 0, 0, W, H);
     drawTrail(ctx);
+    drawMission(ctx);
     drawBoat(ctx);
     requestAnimationFrame(render);
   }
@@ -1002,11 +1120,149 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     notice.textContent = state.notice || '';
   }
 
+  var missions = [];
+  var courante = null;
+  var apercuTimer = null;
+  var ETATS = { veille: 'en attente', demandee: 'demande envoyee', en_cours: 'EN COURS',
+                terminee: 'terminee', arretee: 'arretee', echec: 'echec' };
+
+  function el(id) { return document.getElementById(id); }
+
+  function postJson(url, corps) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-IHM': '1' },
+      body: JSON.stringify(corps || {})
+    }).then(function (r) { return r.json(); });
+  }
+
+  function remplirParametres() {
+    var zone = el('missionParams');
+    zone.innerHTML = '';
+    el('missionDesc').textContent = courante ? courante.description : '';
+    if (!courante) return;
+    courante.parametres.forEach(function (p) {
+      var label = document.createElement('label');
+      label.textContent = p.label;
+      var champ;
+      if (p.type === 'choix') {
+        champ = document.createElement('select');
+        p.choix.forEach(function (c) {
+          var o = document.createElement('option');
+          o.value = c; o.textContent = c;
+          if (c === p.defaut) o.selected = true;
+          champ.appendChild(o);
+        });
+      } else {
+        champ = document.createElement('input');
+        champ.type = 'text';
+        champ.value = p.defaut;
+      }
+      champ.dataset.nom = p.nom;
+      champ.addEventListener('input', demanderApercu);
+      champ.addEventListener('change', demanderApercu);
+      zone.appendChild(label);
+      zone.appendChild(champ);
+    });
+    demanderApercu();
+  }
+
+  function parametresSaisis() {
+    var valeurs = {};
+    var champs = el('missionParams').querySelectorAll('[data-nom]');
+    for (var i = 0; i < champs.length; i++) valeurs[champs[i].dataset.nom] = champs[i].value;
+    return valeurs;
+  }
+
+  function demanderApercu() {
+    clearTimeout(apercuTimer);
+    apercuTimer = setTimeout(function () {
+      if (!courante) return;
+      var q = 'nom=' + encodeURIComponent(courante.nom);
+      var v = parametresSaisis();
+      Object.keys(v).forEach(function (k) { q += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(v[k]); });
+      fetch('/api/apercu?' + q, { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { apercu = j.points; })
+        .catch(function () { apercu = null; });
+    }, 300);
+  }
+
+  function initMissions() {
+    if (!DATA.pilotage) return;
+    el('missionCard').style.display = 'block';
+    fetch('/api/missions').then(function (r) { return r.json(); }).then(function (liste) {
+      missions = liste;
+      var sel = el('missionSel');
+      liste.forEach(function (m, i) {
+        var o = document.createElement('option');
+        o.value = i; o.textContent = m.titre;
+        sel.appendChild(o);
+      });
+      courante = liste.length ? liste[0] : null;
+      remplirParametres();
+    });
+    el('missionSel').addEventListener('change', function (e) {
+      courante = missions[parseInt(e.target.value, 10)];
+      remplirParametres();
+    });
+    el('btnLancer').addEventListener('click', function () {
+      if (!courante) return;
+      var v = parametresSaisis();
+      var attente = v.attente !== undefined ? v.attente : '?';
+      if (!window.confirm(courante.titre + '\n\nLe bateau va demarrer dans ' + attente +
+          ' s. Verifier la zone d\'eau libre et rester pret a appuyer sur ARRET.')) return;
+      postJson('/api/mission/start', { nom: courante.nom, params: v }).then(function (r) {
+        if (!r.ok) window.alert(r.message || 'Lancement refuse');
+      });
+    });
+    el('btnStop').addEventListener('click', function () {
+      postJson('/api/mission/stop', {});
+    });
+  }
+
+  function updateMission() {
+    if (!DATA.pilotage || !state) return;
+    var m = state.mission || {};
+    var etat = m.etat || 'veille';
+    var actif = etat === 'en_cours' || etat === 'demandee';
+    var pastille = el('missionEtat');
+    pastille.textContent = ETATS[etat] || etat;
+    pastille.className = 'mission-etat ' + etat;
+    el('btnLancer').disabled = actif || !courante;
+    el('btnStop').disabled = !actif;
+    el('missionSel').disabled = actif;
+    var champs = el('missionParams').querySelectorAll('[data-nom]');
+    for (var i = 0; i < champs.length; i++) champs[i].disabled = actif;
+
+    var lignes = [];
+    if (state.phase_texte && (actif || etat !== 'veille')) {
+      lignes.push(state.phase_texte + (state.message ? ' : ' + state.message : ''));
+    }
+    if (m.resultat && !actif) lignes.push('Resultat : ' + m.resultat + (m.duree ? ' (' + m.duree.toFixed(0) + ' s)' : ''));
+    if (state.cap !== null && state.cap !== undefined) {
+      var cap = 'Cap ' + state.cap.toFixed(0) + '°';
+      if (actif && state.cap_cible !== null && state.cap_cible !== undefined) cap += ' (vise ' + state.cap_cible.toFixed(0) + '°)';
+      lignes.push(cap);
+    }
+    var g = state.guidage;
+    if (actif && g) {
+      if (g.lateral !== undefined && g.lateral !== null) lignes.push('Ecart lateral ' + g.lateral.toFixed(1) + ' m  (+ = a droite)');
+      if (g.dist_cible !== undefined && g.dist_cible !== null) lignes.push('Cible a ' + g.dist_cible.toFixed(0) + ' m');
+      if (g.crabe !== undefined && g.crabe !== null) lignes.push('Crabe ' + g.crabe.toFixed(0) + '° (derive ' + (g.derive ? 'compensee' : 'non compensee') + ')');
+    }
+    if (state.derive) lignes.push('Derive estimee ' + state.derive.vitesse.toFixed(2) + ' m/s vers ' + state.derive.cap.toFixed(0) + '°');
+    if (state.moteurs) lignes.push('Moteurs ' + state.moteurs[0] + ' / ' + state.moteurs[1]);
+    el('missionStatut').textContent = lignes.join('\n');
+    el('missionJournal').style.display = state.journal ? 'block' : 'none';
+  }
+
   function applyState(s) {
     state = s;
     lastStateAt = Date.now();
     if (s.boat) smoothToBoat(s.boat);
     updateDom();
+    updateMission();
     drawInset();
   }
 
@@ -1141,6 +1397,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   document.getElementById('statusText').textContent = DATA.mode === 'live' ? 'TEMPS RÉEL' : 'SIMULATION';
   if (DATA.mode === 'live') document.getElementById('statusPill').className = 'pill live';
 
+  initMissions();
   resize();
   requestAnimationFrame(render);
   tickClock();
@@ -1556,14 +1813,14 @@ class LiveBoat(object):
 
 
 class MissionBoat(object):
-    """Adapte l'etat de MissionD1 (meme programme) au format de l'IHM.
+    """Adapte l'etat de la Session (meme programme) au format de l'IHM.
 
-    La mission possede le GPS, les moteurs et l'IMU ; l'IHM lit seulement
-    son etat en memoire, sans toucher au materiel.
+    La session possede le GPS, les moteurs et le compas ; l'IHM lit
+    seulement son etat en memoire, sans toucher au materiel.
     """
 
-    def __init__(self, mission):
-        self.mission = mission
+    def __init__(self, session):
+        self.session = session
 
     def _texte(self, p):
         morceaux = [p.get("phase_texte") or p.get("phase") or "?"]
@@ -1581,14 +1838,28 @@ class MissionBoat(object):
         return " · ".join(morceaux)
 
     def get_state(self):
-        p = self.mission.etat()
-        notice = self._texte(p)
+        p = self.session.etat()
         trail = p.get("trail") or []
         age = p.get("fix_age")
+        etat = {
+            "trail": trail,
+            "notice": self._texte(p),
+            "mission": p.get("mission"),
+            "guidage": p.get("guidage"),
+            "derive": p.get("derive"),
+            "vitesse_sol": p.get("vitesse_sol"),
+            "phase": p.get("phase"),
+            "phase_texte": p.get("phase_texte"),
+            "message": p.get("message"),
+            "cap": p.get("cap"),
+            "cap_cible": p.get("cap_cible"),
+            "moteurs": p.get("moteurs"),
+            "journal": p.get("journal"),
+        }
         if p.get("x") is None:
-            return {"boat": None, "trail": trail, "age": None, "stale": True,
-                    "notice": notice}
-        return {
+            etat.update({"boat": None, "age": None, "stale": True})
+            return etat
+        etat.update({
             "x": p["x"],
             "y": p["y"],
             "lat": p.get("lat"),
@@ -1596,11 +1867,10 @@ class MissionBoat(object):
             "heading": p.get("heading") or 0.0,
             "speed": 0.0,
             "heading_source": "compas",
-            "trail": trail,
             "age": age,
             "stale": age is None or age > 3.0,
-            "notice": notice,
-        }
+        })
+        return etat
 
     def close(self):
         pass
@@ -1633,7 +1903,12 @@ class AppState(object):
         if bateau is not None:
             x = bateau["x"]
             y = bateau["y"]
-            vx, vy = self.env.direction(x, y)
+            guidage = etat.get("guidage")
+            if guidage and guidage.get("direction"):
+                # Pendant une mission : la direction reellement commandee.
+                vx, vy = guidage["direction"]
+            else:
+                vx, vy = self.env.direction(x, y)
             vx = float(vx)
             vy = float(vy)
             norme = math.hypot(vx, vy)
@@ -1656,10 +1931,11 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     page = b""
     app_state = None
-    journal = None
+    session = None
 
     def do_GET(self):
-        route = urlparse(self.path).path
+        url = urlparse(self.path)
+        route = url.path
         if route == "/" or route == "/index.html":
             self._envoyer(200, "text/html; charset=utf-8", self.page)
         elif route == "/api/state":
@@ -1672,10 +1948,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._envoyer(500, "application/json; charset=utf-8", corps)
                 return
             self._envoyer(200, "application/json; charset=utf-8", corps)
-        elif route == "/journal" and self.journal is not None:
-            # Journal de la mission en cours, telechargeable depuis le PC.
+        elif route == "/api/missions":
+            liste = self.session.description_missions() if self.session else []
+            self._envoyer_json(200, liste)
+        elif route == "/api/apercu" and self.session is not None:
+            demande = {cle: valeurs[0] for cle, valeurs in parse_qs(
+                url.query, keep_blank_values=True).items()}
+            nom = demande.pop("nom", "")
+            self._envoyer_json(200, {"points": self.session.apercu(nom, demande)})
+        elif route == "/journal" and self.session is not None \
+                and self.session.chemin_journal_courant() is not None:
+            # Journal de la derniere mission, telechargeable depuis le PC.
+            chemin = self.session.chemin_journal_courant()
             try:
-                with open(str(self.journal), "rb") as fichier:
+                with open(str(chemin), "rb") as fichier:
                     corps = fichier.read()
             except OSError as exc:
                 self._envoyer(404, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
@@ -1683,7 +1969,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
             self.send_header("Content-Disposition",
-                             'attachment; filename="{}"'.format(self.journal.name))
+                             'attachment; filename="{}"'.format(chemin.name))
             self.send_header("Content-Length", str(len(corps)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -1697,6 +1983,39 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
         else:
             self._envoyer(404, "text/plain; charset=utf-8", b"not found")
+
+    def do_POST(self):
+        route = urlparse(self.path).path
+        # L'en-tete personnalise force le navigateur a demander la permission
+        # (CORS) : une autre page web ne peut pas piloter le bateau.
+        if self.headers.get("X-IHM") != "1" or self.session is None:
+            self._envoyer_json(403, {"ok": False, "message": "refuse"})
+            return
+        try:
+            longueur = int(self.headers.get("Content-Length") or 0)
+            if longueur > 20000:
+                raise ValueError("requete trop grande")
+            donnees = json.loads(self.rfile.read(longueur).decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._envoyer_json(400, {"ok": False, "message": str(exc)})
+            return
+        if route == "/api/mission/start":
+            try:
+                self.session.lancer(str(donnees.get("nom", "")), donnees.get("params"))
+            except (ValueError, RuntimeError) as exc:
+                self._envoyer_json(400, {"ok": False, "message": str(exc)})
+                return
+            self._envoyer_json(200, {"ok": True})
+        elif route == "/api/mission/stop":
+            self.session.arreter()
+            self._envoyer_json(200, {"ok": True})
+        else:
+            self._envoyer_json(404, {"ok": False, "message": "inconnu"})
+
+    def _envoyer_json(self, code, objet):
+        corps = json.dumps(objet, ensure_ascii=False,
+                           separators=(",", ":")).encode("utf-8")
+        self._envoyer(code, "application/json; charset=utf-8", corps)
 
     def _envoyer(self, code, content_type, corps):
         try:
@@ -1731,37 +2050,84 @@ def adresse_locale():
 
 def parser_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="IHM de visualisation du Lac de Guerledan et du retour a la base.")
+        description="IHM du Lac de Guerledan : visualisation, essais de reglage "
+                    "et missions du bateau.")
+    parser.add_argument("--bateau", action="store_true",
+                        help="ouvrir le materiel (Arduino, GPS, compas) et lancer "
+                             "les essais et missions depuis l'IHM")
+    parser.add_argument("--mission", nargs="?", const="d1", default=None,
+                        metavar="NOM",
+                        help="comme --bateau, et lancer tout de suite la mission "
+                             "NOM (defaut : d1)")
+    parser.add_argument("--param", action="append", default=[], metavar="CLE=VALEUR",
+                        help="parametre de la mission lancee avec --mission "
+                             "(repetable, ex. --param attente=5)")
+    parser.add_argument("--simulation", action="store_true",
+                        help="avec --bateau ou --mission : bateau simule, sans materiel")
+    parser.add_argument("--acceleration", type=float, default=1.0,
+                        help="simulation : facteur d'acceleration du temps (defaut : 1)")
+    parser.add_argument("--sim-vent", default="0.3,0.36", metavar="EST,NORD",
+                        help="simulation : derive du vent en m/s (defaut : 0.3,0.36)")
+    parser.add_argument("--sim-depart", default="15,8,330", metavar="X,Y,CAP",
+                        help="simulation : position (m) et cap (deg) de depart")
     parser.add_argument("--live", action="store_true",
                         help="lire la position GPS reelle au lieu de la simulation")
-    parser.add_argument("--mission", action="store_true",
-                        help="lancer la mission D1 (aller vers D1, tour complet, "
-                             "retour par le couloir) et l'afficher")
     parser.add_argument("--gps", type=int, choices=(0, 1, 2), default=0,
                         help="peripherique GPS : /dev/ttyGPS0, 1 ou 2 (defaut : 0)")
-    parser.add_argument("--attente", type=float, default=10.0,
-                        help="mission : compte a rebours avant le depart en s "
-                             "(defaut : 10)")
-    parser.add_argument("--confirmations", type=int, default=3,
-                        help="mission : fix GPS hors limites successifs pour "
-                             "valider la sortie (defaut : 3)")
-    parser.add_argument("--rayon-arrivee", type=float, default=5.0,
-                        help="mission : distance a la base consideree atteinte "
-                             "en m (defaut : 5)")
+    parser.add_argument("--attente", type=float, default=None,
+                        help="raccourci de --param attente=... (compte a rebours en s)")
+    parser.add_argument("--confirmations", type=int, default=None,
+                        help="raccourci de --param confirmations=... (mission d1)")
+    parser.add_argument("--rayon-arrivee", type=float, default=None,
+                        help="raccourci de --param rayon_arrivee=...")
     parser.add_argument("--host", default=None,
                         help="adresse d'ecoute (defaut : 127.0.0.1, "
-                             "0.0.0.0 avec --mission)")
+                             "0.0.0.0 avec --bateau ou --mission)")
     parser.add_argument("--port", type=int, default=8000,
                         help="port HTTP (defaut : 8000)")
     parser.add_argument("--no-browser", action="store_true",
                         help="ne pas ouvrir automatiquement le navigateur")
     args = parser.parse_args(argv)
+    args.pilotage = args.bateau or args.mission is not None
+    if args.simulation and not args.pilotage:
+        parser.error("--simulation s'utilise avec --bateau ou --mission")
     if args.host is None:
-        args.host = "0.0.0.0" if args.mission else "127.0.0.1"
-    if args.mission:
+        args.host = "0.0.0.0" if args.pilotage and not args.simulation else "127.0.0.1"
+    if args.pilotage and not args.simulation:
         # Sur le bateau, il n'y a pas de navigateur a ouvrir.
         args.no_browser = True
     return args
+
+
+def parametres_simulation(args):
+    """Options du bateau simule a partir des arguments."""
+    vent = [float(v) for v in args.sim_vent.split(",")]
+    depart = [float(v) for v in args.sim_depart.split(",")]
+    if len(vent) != 2 or len(depart) != 3:
+        raise ValueError("--sim-vent : EST,NORD ; --sim-depart : X,Y,CAP")
+    return {"acceleration": args.acceleration, "vent": tuple(vent),
+            "depart": tuple(depart)}
+
+
+def parametres_mission(args, classe):
+    """Parametres de la mission lancee en ligne de commande."""
+    brut = {}
+    for raccourci, valeur in (("attente", args.attente),
+                              ("confirmations", args.confirmations),
+                              ("rayon_arrivee", args.rayon_arrivee)):
+        if valeur is not None:
+            brut[raccourci] = valeur
+    for texte in args.param:
+        if "=" not in texte:
+            raise ValueError("--param attend CLE=VALEUR : {}".format(texte))
+        cle, valeur = texte.split("=", 1)
+        brut[cle.strip()] = valeur
+    connus = [definition["nom"] for definition in classe.PARAMETRES]
+    for cle in brut:
+        if cle not in connus:
+            raise ValueError("parametre inconnu pour {} : {} (connus : {})".format(
+                classe.NOM, cle, ", ".join(connus)))
+    return brut
 
 
 def main(argv=None):
@@ -1776,22 +2142,41 @@ def main(argv=None):
     mode = "demo"
     notice = "Simulation : trajectoire le long du gradient"
     bateau = None
-    mission = None
+    session = None
+    demande = None
 
-    if args.mission:
+    if args.pilotage:
         if str(BASE_DIR) not in sys.path:
             sys.path.insert(0, str(BASE_DIR))
-        from mission_d1 import MissionD1
-        mission = MissionD1(env, {
-            "gps": args.gps,
-            "attente": args.attente,
-            "confirmations": args.confirmations,
-            "rayon_arrivee": args.rayon_arrivee,
-        })
-        bateau = MissionBoat(mission)
-        mode = "live"
-        notice = "Mission D1"
-        Handler.journal = mission.journal.chemin
+        from session import Session
+        from missions import enregistrer_missions
+        try:
+            simulation = parametres_simulation(args) if args.simulation else None
+        except ValueError as exc:
+            print(exc)
+            return 1
+        session = Session(env, gps=args.gps, simulation=simulation)
+        enregistrer_missions(session)
+        if args.mission is not None:
+            classe = session.missions.get(args.mission)
+            if classe is None:
+                print("Mission inconnue : {} (disponibles : {})".format(
+                    args.mission, ", ".join(sorted(session.missions))))
+                return 1
+            try:
+                demande = (args.mission, session.valider_parametres(
+                    classe, parametres_mission(args, classe)))
+            except ValueError as exc:
+                print(exc)
+                return 1
+        try:
+            session.ouvrir_materiel()
+        except Exception as exc:
+            print("Materiel indisponible : {}".format(exc))
+            return 1
+        bateau = MissionBoat(session)
+        mode = "sim" if args.simulation else "live"
+        notice = "Bateau simule" if args.simulation else "Bateau pret"
     elif args.live:
         try:
             bateau = LiveBoat(env, gps_index=args.gps)
@@ -1809,16 +2194,20 @@ def main(argv=None):
     app_state = AppState(env, bateau, mode, notice)
     static = construire_statique(env)
     static["mode"] = mode
+    static["pilotage"] = session is not None
     static_json = json.dumps(static, ensure_ascii=False, separators=(",", ":"))
     page = PAGE_TEMPLATE.replace("__STATIC_JSON__", static_json)
 
     Handler.page = page.encode("utf-8")
     Handler.app_state = app_state
+    Handler.session = session
 
     try:
         serveur = Serveur((args.host, args.port), Handler)
     except OSError as exc:
         print("Impossible d'ouvrir le port {} : {}".format(args.port, exc))
+        if session is not None:
+            session.fermer_materiel()
         bateau.close()
         return 1
 
@@ -1831,10 +2220,12 @@ def main(argv=None):
         locale = adresse_locale()
         if locale:
             print("Depuis le reseau local : http://{}:{}/".format(locale, args.port))
-            if mission is not None:
-                print("Journal de mission : http://{}:{}/journal".format(locale, args.port))
-    if mission is not None:
-        print("Mode : mission D1")
+            if session is not None:
+                print("Journal de la derniere mission : http://{}:{}/journal".format(
+                    locale, args.port))
+    if session is not None:
+        print("Mode : {}".format("bateau simule" if args.simulation else "bateau"))
+        print("Essais et missions : depuis la page de l'IHM (panneau Missions).")
     else:
         print("Mode : {}".format("GPS temps reel" if mode == "live" else "simulation"))
     print("Ctrl+C pour arreter.")
@@ -1846,25 +2237,27 @@ def main(argv=None):
 
     code = 0
     try:
-        if mission is None:
+        if session is None:
             serveur.serve_forever(poll_interval=0.5)
         else:
-            # Le serveur tourne en arriere-plan ; la mission reste dans le
-            # thread principal pour que Ctrl+C coupe les moteurs.
+            # Le serveur tourne en arriere-plan ; les missions s'executent
+            # dans le thread principal pour que Ctrl+C coupe les moteurs.
             fil = threading.Thread(target=serveur.serve_forever,
                                    kwargs={"poll_interval": 0.5}, name="ihm")
             fil.daemon = True
             fil.start()
-            code = mission.executer()
-            print("L'IHM reste ouverte pour consulter la trace. Ctrl+C pour quitter.")
-            sys.stdout.flush()
-            while True:
-                time.sleep(1.0)
+            if demande is not None:
+                code = session.executer(*demande)
+                print("L'IHM reste ouverte : trace consultable, autres missions "
+                      "lancables. Ctrl+C pour quitter.")
+                sys.stdout.flush()
+            session.boucle_principale()
     except KeyboardInterrupt:
         print("\nArret de l'IHM.")
     finally:
-        if mission is not None:
+        if session is not None:
             serveur.shutdown()
+            session.fermer_materiel()
         serveur.server_close()
         try:
             bateau.close()
