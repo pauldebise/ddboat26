@@ -349,9 +349,12 @@ class MissionPolygone(_MissionNavigation):
         _param("derive", "Compensation de derive", "oui", type="choix",
                choix=CHOIX_OUI_NON),
         _param("rayon_arrivee", "Rayon d'arrivee aux sommets (m)", 3.0),
+        _param("rayon_final", "Rayon d'arrivee au dernier sommet (m)", 6.0),
+        _param("ralentir_fin", "Ralentir sur les derniers (m)", 15.0),
+        _param("vitesse_fin", "Vitesse d'arrivee (commande moteur)", 90, type="entier"),
         _param("k_ligne", "Gain de ligne (1/m)", SuiveurChemin.K_LIGNE),
         _param("vitesse", "Vitesse (commande moteur)", 150, type="entier"),
-        _param("ecart_max", "Arret si ecart au polygone > (m)", 40.0),
+        _param("ecart_max", "Arret si ecart au chemin > (m)", 40.0),
         _param("timeout", "Duree maximale (s)", 1800.0),
         _param("attente", "Compte a rebours (s)", 10.0),
     ]
@@ -359,7 +362,10 @@ class MissionPolygone(_MissionNavigation):
     @classmethod
     def apercu(cls, session, parametres):
         points, ferme, _ = charger_polygone(session, parametres["fichier"])
-        return points + [points[0]] if ferme else points
+        if ferme:
+            return points + [points[0]]
+        position = session.position_actuelle()
+        return ([[position[0], position[1]]] if position else []) + points
 
     def executer(self):
         s, ddb, p = self.s, self.ddb, self.p
@@ -379,14 +385,15 @@ class MissionPolygone(_MissionNavigation):
         else:
             chemin = [a] + sommets
         suiveur = SuiveurChemin(chemin, rayon_arrivee=p["rayon_arrivee"],
-                                k_ligne=p["k_ligne"])
+                                k_ligne=p["k_ligne"], rayon_final=p["rayon_final"])
         s.ecrire_journal("chemin", {"points": chemin,
                                     "longueur": suiveur.longueur_totale()})
         s.definir_phase("NAVIGATION", "polygone « {} » : {} sommets, {:.0f} m".format(
             nom, len(sommets), suiveur.longueur_totale()))
         issue, resume = s.suivre_chemin(
             suiveur, derive=p["derive"] == "oui", vitesse=p["vitesse"],
-            ecart_max=p["ecart_max"], timeout=p["timeout"], etiquette="polygone")
+            ecart_max=p["ecart_max"], timeout=p["timeout"], etiquette=self.NOM,
+            ralentir_fin=p["ralentir_fin"], vitesse_fin=p["vitesse_fin"])
         position, _ = s.position_fraiche()
         s.ecrire_journal("bilan", {
             "issue": issue, "segments": resume,
@@ -399,7 +406,24 @@ class MissionPolygone(_MissionNavigation):
         return 0, "termine"
 
 
-MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone]
+class Mission3(MissionPolygone):
+    NOM = "mission3"
+    TITRE = "Mission 3 : A-C-D-G'-E-F-G-A"
+    DESCRIPTION = ("Trajet A-C-D-G'-E-F-G-A (mission3.json) : gradient de ligne et "
+                   "gradient ponctuel, avec compensation de derive. Part de la "
+                   "base A, finit a A en ralentissant pour s'arreter avant le "
+                   "ponton. 625 m, environ 9 minutes.")
+    PARAMETRES = [dict(definition, defaut="mission3.json")
+                  if definition["nom"] == "fichier" else definition
+                  for definition in MissionPolygone.PARAMETRES
+                  if definition["nom"] != "tours"]
+
+    def __init__(self, session, parametres):
+        parametres = dict(parametres, tours=1)
+        super(Mission3, self).__init__(session, parametres)
+
+
+MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone, Mission3]
 
 
 def enregistrer_missions(session):

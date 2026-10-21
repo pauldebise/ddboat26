@@ -1,0 +1,15 @@
+{
+  "nom": "Mission 3 : A-C-D-G'-E-F-G-A",
+  "ferme": false,
+  "noms": ["C", "D", "G'", "E", "F", "G", "A"],
+  "points_latlon": [
+    [48.198124, -3.015355],
+    [48.198259, -3.017114],
+    [48.199027, -3.015887],
+    [48.199628, -3.016379],
+    [48.199688, -3.015158],
+    [48.198944, -3.015478],
+    [48.198863, -3.015070]
+  ],
+  "commentaire": "Le bateau part de A (la base) : le premier segment va de sa position de depart a C. A = 48.198863,-3.015070 (base), B = 48.199072,-3.016258 (entree du couloir, non visite). G et G' sont sur l'axe du couloir."
+}

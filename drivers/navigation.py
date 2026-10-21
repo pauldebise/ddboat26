@@ -33,11 +33,15 @@ class SuiveurChemin(object):
     K_LIGNE = 0.2
     K_POINT = 1.0
 
-    def __init__(self, points, rayon_arrivee=3.0, k_ligne=None, k_point=None):
+    def __init__(self, points, rayon_arrivee=3.0, k_ligne=None, k_point=None,
+                 rayon_final=None):
         self.points = np.array(points, dtype=float).reshape(-1, 2)
         if len(self.points) < 2:
             raise ValueError("un chemin demande au moins deux points")
         self.rayon_arrivee = float(rayon_arrivee)
+        # Rayon du dernier sommet (par defaut le meme) : plus grand, il arrete
+        # le bateau avant un ponton.
+        self.rayon_final = self.rayon_arrivee if rayon_final is None else float(rayon_final)
         self.k_ligne = self.K_LIGNE if k_ligne is None else float(k_ligne)
         self.k_point = self.K_POINT if k_point is None else float(k_point)
         self.segment = 0          # indice du segment courant : points[i] -> points[i+1]
@@ -65,6 +69,15 @@ class SuiveurChemin(object):
             t = 0.0 if carre < 1e-12 else max(0.0, min(1.0, float(np.dot(p - a, ab)) / carre))
             meilleur = min(meilleur, float(np.linalg.norm(p - (a + t * ab))))
         return meilleur
+
+    def rayon_courant(self):
+        """Rayon d'arrivee du sommet vise."""
+        if self.segment + 1 >= self.nombre_segments:
+            return self.rayon_final
+        return self.rayon_arrivee
+
+    def sur_dernier_segment(self):
+        return self.segment + 1 >= self.nombre_segments
 
     def _geometrie(self, position):
         a, b = self.segment_courant()
@@ -98,9 +111,10 @@ class SuiveurChemin(object):
         sommet_atteint = None
         while not self.termine:
             a, b, u, longueur, s, q, lateral, vers_b, dist_b = self._geometrie(position)
-            atteint = dist_b <= self.rayon_arrivee or (
+            rayon = self.rayon_courant()
+            atteint = dist_b <= rayon or (
                 longueur >= 0.5 and s >= longueur
-                and abs(lateral) <= 2.5 * self.rayon_arrivee)
+                and abs(lateral) <= 2.5 * rayon)
             if not atteint:
                 break
             sommet_atteint = self.segment + 1

@@ -574,8 +574,13 @@ class Session(object):
             time.sleep(0.5)
 
     def suivre_chemin(self, suiveur, derive=True, vitesse=None, ecart_max=60.0,
-                      timeout=900.0, etiquette="chemin"):
+                      timeout=900.0, etiquette="chemin", ralentir_fin=0.0,
+                      vitesse_fin=90):
         """Suit un SuiveurChemin jusqu'a son dernier sommet.
+
+        Sur le dernier segment, la vitesse diminue lineairement jusqu'a
+        vitesse_fin sur les ralentir_fin metres qui precedent le rayon
+        d'arret (0 = pas de ralentissement) : le bateau arrive doucement.
 
         Retourne (issue, stats) ; issue vaut "termine", "timeout" ou
         "ecart_max". stats contient, par segment parcouru, l'ecart lateral
@@ -634,9 +639,17 @@ class Session(object):
                         "x": position[0], "y": position[1], "ecart": ecart})
                     break
 
+                vitesse_ligne = vitesse
+                if ralentir_fin > 0.0 and suiveur.sur_dernier_segment():
+                    pleine = vitesse if vitesse is not None else ddb.vitesse_croisiere
+                    # Distance qui reste avant le rayon d'arret.
+                    restant = max(0.0, info["dist_cible"] - suiveur.rayon_final)
+                    vitesse_ligne = vitesse_fin + (pleine - vitesse_fin) * min(
+                        1.0, restant / ralentir_fin)
+                    vitesse_ligne = min(pleine, vitesse_ligne)
                 cible, cap, gauche, droite = ddb.maintien_cap(
                     info["direction"], self.env.rotation, derive=derive,
-                    vitesse=vitesse)
+                    vitesse=vitesse_ligne)
                 asserv = ddb.dernier_asservissement
                 sol = ddb.vitesse_sol or {}
                 if info["s"] >= 0.2 * info["longueur"]:

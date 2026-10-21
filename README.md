@@ -25,6 +25,7 @@ aussi les moteurs.
 | Essai 2 : suivi de segment | Aller-retour sur un segment, sans puis avec compensation de dérive : mesure l'écart latéral |
 | Essai 3 : ralliement d'un point | Gradient ponctuel seul, comme le homing |
 | Mission : polygone | Parcourt le polygone de `polygone.json` (gradient de ligne + gradient ponctuel) |
+| Mission 3 | Trajet A-C-D-G'-E-F-G-A de `mission3.json`, termine à A en ralentissant pour s'arrêter avant le ponton |
 | Mission D1 | Aller vers D1, tour complet, retour par le couloir |
 
 Le polygone se décrit dans `polygone.json` (voir `polygone.exemple.json`),
