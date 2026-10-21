@@ -12,8 +12,11 @@ segments P0->P1, P1->P2, ... Sur le segment A->B, le vecteur de guidage est
 
 - gradient de ligne : -q est la perpendiculaire qui ramene le bateau sur le
   segment [A, B] (q = vecteur du point le plus proche du segment vers le
-  bateau). k_ligne est en 1/m : a 5 m du segment, avec k_ligne = 0,2, la
-  composante laterale egale la composante vers B ;
+  bateau). k_ligne est en 1/m : a 20 m du segment, avec k_ligne = 0,05, la
+  composante laterale egale la composante vers B. Ce gain doit rester
+  faible : le cap du bateau repond avec ~3 s de constante de temps et 0,5 s
+  de retard, et la boucle de ligne doit etre bien plus lente que celle du cap
+  (a 0,2, essais du 21/10 : oscillation de +-60 deg et +-3 m, periode 20 s) ;
 - gradient ponctuel : le vecteur unitaire qui pointe vers le sommet vise.
 
 Avec k_ligne = 0, il ne reste que le gradient ponctuel (ralliement d'un
@@ -30,7 +33,7 @@ import numpy as np
 
 
 class SuiveurChemin(object):
-    K_LIGNE = 0.2
+    K_LIGNE = 0.05
     K_POINT = 1.0
 
     def __init__(self, points, rayon_arrivee=3.0, k_ligne=None, k_point=None,
