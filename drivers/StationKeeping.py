@@ -25,7 +25,7 @@ if __name__ == "__main__":
         pos_ddb = ddb.get_DDboat_cart_position(home)
 
         if dist_cart(pos_ddb, pos_keep_point) < rayon_zone:
-            continue
+            ddb.ard.send_arduino_cmd_motor(0, 0)
 
         else:
             ddb.rejoindre_keeping_zone(pos_keep_point, home)
