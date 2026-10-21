@@ -59,14 +59,14 @@ def installer_horloge(acceleration):
 
 class MondeSimule(object):
     GAIN_VITESSE = 1.3 / 150.0          # m/s par unite de commande
-    GAIN_ROTATION = math.radians(0.25)  # rad/s par unite de difference de poussee
     TAU_VITESSE = 1.0
-    TAU_ROTATION = 0.6
 
     def __init__(self, origine, rotation=0.0, depart=(15.0, 8.0, 330.0),
                  vent=(0.30, 0.36), asymetrie=0.04, biais_compas=8.0,
                  bruit_compas=1.2, bruit_gps=0.15, couple=4.0,
-                 direction_couple=180.0, sens_physique=1, graine=1):
+                 direction_couple=180.0, sens_physique=1, graine=1,
+                 retard_commande=0.25, periode_compas=0.097, gain_rotation=0.5,
+                 tau_rotation=0.5):
         self.origine = (float(origine[0]), float(origine[1]))
         self.rotation = float(rotation)
         self.verrou = threading.RLock()
@@ -87,6 +87,12 @@ class MondeSimule(object):
         self.direction_couple = math.radians(direction_couple)
         self.sens_physique = sens_physique
         self.commande = (0.0, 0.0)
+        self.historique = []              # (instant, gauche, droite)
+        self.retard_commande = retard_commande
+        self.periode_compas = periode_compas
+        self.gain_rotation = math.radians(gain_rotation)
+        self.tau_rotation = tau_rotation
+        self.compas = None                # (instant de l'echantillon, valeur)
         self.amarre = True
         self.erreur_gps = [0.0, 0.0]
         self.t = time.monotonic()
@@ -102,32 +108,51 @@ class MondeSimule(object):
                 self.t += dt
 
     def _pas(self, dt):
-        gauche, droite = self.commande
+        gauche, droite = self.commande_retardee()
         poussee_g = gauche * (1.0 - self.asymetrie)
         poussee_d = droite * (1.0 + self.asymetrie)
         cible_vitesse = self.GAIN_VITESSE * (poussee_g + poussee_d) / 2.0
         self.vitesse += (cible_vitesse - self.vitesse) * dt / self.TAU_VITESSE
-        cible_rotation = self.sens_physique * self.GAIN_ROTATION * (poussee_g - poussee_d)
+        cible_rotation = self.sens_physique * self.gain_rotation * (poussee_g - poussee_d)
         if not self.amarre:
             cible_rotation += self.couple * math.sin(self.cap - self.direction_couple)
-        self.rotation_cap += (cible_rotation - self.rotation_cap) * dt / self.TAU_ROTATION
+        self.rotation_cap += (cible_rotation - self.rotation_cap) * dt / self.tau_rotation
         self.cap += self.rotation_cap * dt
         if not self.amarre:
             self.est += (self.vitesse * math.sin(self.cap) + self.vent[0]) * dt
             self.nord += (self.vitesse * math.cos(self.cap) + self.vent[1]) * dt
 
+    def commande_retardee(self):
+        """Commande effectivement appliquee : celle d'il y a `retard_commande` s."""
+        instant = self.t - self.retard_commande
+        courant = (0.0, 0.0)
+        for (t, g, d) in self.historique:
+            if t <= instant:
+                courant = (g, d)
+            else:
+                break
+        return courant
+
     def commander(self, gauche, droite):
         with self.verrou:
             self.avancer()
             self.commande = (float(gauche), float(droite))
+            self.historique.append((self.t, float(gauche), float(droite)))
+            while len(self.historique) > 2 and self.historique[1][0] < self.t - 2.0:
+                self.historique.pop(0)
             if self.amarre and abs(gauche) + abs(droite) > 60.0:
                 self.amarre = False
 
     def cap_mesure(self):
+        # Le capteur ne produit qu'un echantillon toutes les ~0,1 s (10 Hz) :
+        # les lectures plus rapides repetent la meme valeur.
         with self.verrou:
             self.avancer()
-            biais = self.biais_compas
-            return (self.cap + biais + self.hasard.gauss(0.0, self.bruit_compas)) % (2 * math.pi)
+            if self.compas is None or self.t - self.compas[0] >= self.periode_compas:
+                valeur = (self.cap + self.biais_compas
+                          + self.hasard.gauss(0.0, self.bruit_compas)) % (2 * math.pi)
+                self.compas = (self.t, valeur)
+            return self.compas[1]
 
     def position_locale(self):
         """(x, y) vrais dans le repere local."""
