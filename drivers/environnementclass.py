@@ -1,3 +1,4 @@
+from ddboat26.mesure_point_gps import nmea_vers_decimal
 from ddboatclass import DDBoat
 import numpy as np
 
@@ -17,8 +18,7 @@ coord_couloir[0] = ddb_calcul.convert_cart_position(coord_couloir[0][0], coord_c
 coord_couloir[1] = ddb_calcul.convert_cart_position(coord_couloir[1][0], coord_couloir[1][1], coord_home, rotation)
 print("Coordonnées converties.")
 
-#pour jalon 3, définition du point autour duquel on doit rester statique
-coord_station_keeping_point = np.array([0,0])
+
 
 
 class Environnement:
@@ -30,7 +30,7 @@ class Environnement:
         self.couloir = coord_couloir  # position du couloir dans le repere local (x, y).
         self.bordure_gauche = coord_bordure_gauche  # position de la bordure gauche dans le repere local (x, y).
         self.bordure_droite = coord_bordure_droite  # position de la bordure droite dans le repere local (x, y).
-        self.station_keeping_point = coord_station_keeping_point
+
 
     def gradient_artificiel_point(self, x_pt: float, y_pt: float, x_pos: float, y_pos: float, attract: bool):
         signe = (-1) if attract else 1
@@ -192,3 +192,6 @@ class Environnement:
         # Aucune condition sur la coordonnee le long du couloir : il n'y a
         # pas de bordure avant/arriere.
         return d_droite <= 0.0 and d_gauche <= 0.0
+
+    def assignation_keeping_point(self, coord_station_keeping_point):
+        self.station_keeping_point = coord_station_keeping_point
