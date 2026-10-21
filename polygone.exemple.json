@@ -1,0 +1,6 @@
+{
+  "nom": "Exemple de polygone (a remplacer)",
+  "ferme": true,
+  "points_xy": [[20, 20], [50, 20], [50, 50], [20, 50]],
+  "commentaire": "Copier ce fichier en polygone.json. Les points sont en metres dans le repere local (x = est, y = nord, origine = base). Pour des coordonnees GPS, remplacer points_xy par points_latlon : [[lat, lon], ...]. ferme = true : retour au premier sommet."
+}

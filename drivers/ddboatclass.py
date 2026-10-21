@@ -14,13 +14,19 @@ if __package__:
     from .gps_driver_v2 import GpsIO
     from .imu9_driver_v2 import Imu9IO
     from .cap_sender_v3 import compute_heading, load_calibration
+    from .derive import EstimateurDerive
 else:
     from arduino_driver_v2 import ArduinoIO
     from gps_driver_v2 import GpsIO
     from imu9_driver_v2 import Imu9IO
     from cap_sender_v3 import compute_heading, load_calibration
+    from derive import EstimateurDerive
 
 DRIVERS_DIR = Path(__file__).resolve().parent
+
+
+class ArretDemande(Exception):
+    """Levee dans les boucles de navigation quand l'arret est demande (IHM)."""
 
 
 def angle_diff(target, current):
@@ -112,6 +118,18 @@ def parser_trame_gll(trame):
     return lat, lon
 
 
+def heure_trame_gll(trame):
+    """Heure UTC (secondes depuis minuit) d'une trame GLL, sinon None."""
+    champs = trame.split(",")
+    if len(champs) < 6 or len(champs[5]) < 6:
+        return None
+    try:
+        return (int(champs[5][0:2]) * 3600.0 + int(champs[5][2:4]) * 60.0
+                + float(champs[5][4:]))
+    except ValueError:
+        return None
+
+
 def parser_trame_gga(trame):
     """Retourne (qualite, satellites, hdop) d'une trame GGA, sinon None."""
     if not trame.startswith("$") or "*" not in trame:
@@ -152,6 +170,23 @@ class DDBoat:
     # augmentant dans le sens horaire, la valeur par defaut est -1.
     SENS_ROTATION = -1
 
+    # Regulateur de cap (voir _regulateur_cap). Unites : commande moteur
+    # (0-255) par radian d'erreur, ou par radian.seconde, ou par rad/s.
+    # Le journal de la mission du 20/10 montrait un ecart de cap permanent de
+    # 12 a 25 deg avec Kp = 25 sous le vent : le terme integral le supprime.
+    KP_CAP = 80.0
+    KI_CAP = 12.0
+    KD_CAP = 22.0                       # amortissement sur la vitesse de rotation
+    LIMITE_INTEGRALE = 40.0             # correction integrale maximale (commande)
+    LIMITE_DERIVEE = 30.0
+    ZONE_INTEGRALE = math.radians(45.0)  # pas d'integration au-dela de cet ecart
+    OUBLI_INTEGRALE = 1.0               # constante d'oubli pendant un grand virage (s)
+    TAU_DERIVEE = 0.4                   # filtre de la vitesse de rotation (s)
+    VITESSE_CROISIERE = 150             # commande moteur moyenne en route
+    COMMANDE_MAX = 191
+    # Compensation de la derive (vent, courant) par un cap de « crabe ».
+    COMPENSATION_DERIVE = True
+
     def __init__(self, ard, gps, imu) -> None:
         self.ard = ard
         self.gps = gps
@@ -180,6 +215,25 @@ class DDBoat:
         # Journal optionnel : fonction appelee avec (type, dict). Laisse a
         # None, aucune donnee n'est enregistree.
         self.journal = None
+
+        # Arret demande depuis l'IHM : les boucles de navigation levent
+        # ArretDemande quand cet evenement est positionne.
+        self.arret = threading.Event()
+
+        # Lecture du compas depuis plusieurs threads (mission, veille).
+        self._verrou_imu = threading.Lock()
+        # Cap et commande moyens entre deux fix GPS, pour estimer la derive.
+        self._verrou_cap = threading.Lock()
+        self._acc_cap = [0.0, 0.0, 0]       # somme sin, somme cos, nombre
+        self._acc_commande = [0.0, 0]       # somme des commandes moyennes, nombre
+        self._fix_precedent = None          # (lat, lon, heure_utc, instant)
+        self.derive = EstimateurDerive()
+        self.vitesse_sol = None             # dernier calcul : dict ou None
+        self.vitesse_croisiere = self.VITESSE_CROISIERE
+        self.derniere_commande = (0, 0)
+        self.derniere_route = None
+        self.dernier_asservissement = {}
+        self._reg = {"i": 0.0, "rotation": 0.0, "cap": None, "t": None}
 
     def _journaliser(self, type_evenement, **donnees):
         """Transmet un evenement au journal, sans jamais bloquer le bateau."""
@@ -223,19 +277,44 @@ class DDBoat:
 
     def current_cap_rad(self):
         self._ensure_calibration()
-        xmag, ymag, zmag = self.imu.read_mag_raw()
+        with self._verrou_imu:
+            xmag, ymag, zmag = self.imu.read_mag_raw()
         self.dernier_mag_brut = (xmag, ymag, zmag)
         heading_rad = compute_heading([xmag, ymag, zmag], self.invA, self.xbar)
         # Cap boussole : 0 = Nord, croissant dans le sens horaire.
         self.dernier_cap = heading_rad % (2 * math.pi)
+        with self._verrou_cap:
+            self._acc_cap[0] += math.sin(self.dernier_cap)
+            self._acc_cap[1] += math.cos(self.dernier_cap)
+            self._acc_cap[2] += 1
         return self.dernier_cap
 
     def current_cap_deg(self):
         return np.degrees(self.current_cap_rad())
 
+    def _commander_moteurs(self, gauche, droite):
+        """Envoie une commande et la memorise pour l'estimation de derive.
+
+        Si l'arret est demande, aucune commande non nulle ne part : les
+        moteurs sont coupes et ArretDemande interrompt la boucle appelante.
+        """
+        if self.arret.is_set() and (gauche or droite):
+            self.ard.send_arduino_cmd_motor(0, 0)
+            self.derniere_commande = (0, 0)
+            raise ArretDemande()
+        self.ard.send_arduino_cmd_motor(gauche, droite)
+        self.derniere_commande = (gauche, droite)
+        with self._verrou_cap:
+            self._acc_commande[0] += (gauche + droite) / 2.0
+            self._acc_commande[1] += 1
+
     def _arreter_moteurs(self):
         """Coupe les deux moteurs."""
-        self.ard.send_arduino_cmd_motor(0, 0)
+        self._commander_moteurs(0, 0)
+
+    def _verifier_arret(self):
+        if self.arret.is_set():
+            raise ArretDemande()
 
     def _tourner_vers_cap(self, cible):
         """Fait tourner le bateau jusqu'au cap cible.
@@ -248,6 +327,7 @@ class DDBoat:
         debut = time.monotonic()
 
         while True:
+            self._verifier_arret()
             current = self.current_cap_rad()
 
             # angle_diff() donne l'ecart le plus court entre les deux caps,
@@ -282,7 +362,7 @@ class DDBoat:
                 commande = (-self.VITESSE_ROTATION, self.VITESSE_ROTATION)
             else:
                 commande = (self.VITESSE_ROTATION, -self.VITESSE_ROTATION)
-            self.ard.send_arduino_cmd_motor(commande[0], commande[1])
+            self._commander_moteurs(commande[0], commande[1])
             self._journaliser("tour", cible=math.degrees(cible),
                               cap=math.degrees(current),
                               erreur=math.degrees(erreur),
@@ -433,7 +513,49 @@ class DDBoat:
                 self.instant_fix_gps = time.monotonic()
                 self.compteur_fix_gps += 1
                 nouvelle = True
+                self._nouveau_fix(position, heure_trame_gll(trame),
+                                  self.instant_fix_gps)
         return nouvelle
+
+    def _nouveau_fix(self, position, heure_utc, instant):
+        """Vitesse sol du dernier intervalle, et mesure pour l'estimateur de derive."""
+        lat, lon = position
+        precedent = self._fix_precedent
+        self._fix_precedent = (lat, lon, heure_utc, instant)
+        with self._verrou_cap:
+            somme_sin, somme_cos, n_cap = self._acc_cap
+            somme_cmd, n_cmd = self._acc_commande
+            self._acc_cap = [0.0, 0.0, 0]
+            self._acc_commande = [0.0, 0]
+        if precedent is None:
+            return
+        if heure_utc is not None and precedent[2] is not None:
+            duree = (heure_utc - precedent[2]) % 86400.0
+        else:
+            duree = instant - precedent[3]
+        if not (0.4 <= duree <= 3.0):
+            return
+        rayon = 6371000.0
+        nord = math.radians(lat - precedent[0]) * rayon
+        est = (math.radians(lon - precedent[1]) * rayon
+               * math.cos(math.radians(precedent[0])))
+        v_est, v_nord = est / duree, nord / duree
+        vitesse = math.hypot(v_est, v_nord)
+        self.vitesse_sol = {
+            "est": v_est, "nord": v_nord, "vitesse": vitesse,
+            "cog": math.degrees(math.atan2(v_est, v_nord)) % 360.0,
+            "instant": instant,
+        }
+        if n_cap < 3:
+            return
+        cap_moyen = math.atan2(somme_sin, somme_cos)
+        longueur = min(1.0, math.hypot(somme_sin, somme_cos) / n_cap)
+        dispersion = math.sqrt(max(0.0, -2.0 * math.log(max(longueur, 1e-9))))
+        commande = somme_cmd / n_cmd if n_cmd else 0.0
+        self.vitesse_sol["cap_moyen"] = math.degrees(cap_moyen) % 360.0
+        self.vitesse_sol["commande"] = commande
+        self.derive.ajouter(instant, duree, v_est, v_nord, cap_moyen,
+                            dispersion, commande)
 
     def age_fix_gps(self):
         """Age du dernier fix GPS en secondes, ou None si aucun fix."""
@@ -474,23 +596,132 @@ class DDBoat:
             time.sleep(0.1)
         return None
 
-    def maintien_cap(self, target_dir, angle_rotation=0.0):
+    def reinitialiser_asservissement(self):
+        """Remet a zero l'integrale et la derivee du regulateur de cap."""
+        self._reg = {"i": 0.0, "rotation": 0.0, "cap": None, "t": None}
+
+    def _regulateur_cap(self, erreur, cap):
+        """Regulateur PID de l'ecart de cap (rad). Retourne (u, detail).
+
+        u > 0 : il faut augmenter le cap (tourner a droite).
+        - P : proportionnel a l'ecart ;
+        - I : supprime l'ecart permanent cause par le vent ou par des
+          moteurs de poussee differente. Il est borne (anti-emballement) et
+          gele quand l'ecart est grand ou la commande saturee ;
+        - D : amortit avec la vitesse de rotation mesuree (filtree), plutot
+          qu'avec la derivee de la consigne, pour ne pas reagir aux sauts de
+          route.
+        """
+        reg = self._reg
+        maintenant = time.monotonic()
+        dt = None
+        if reg["t"] is not None:
+            dt = maintenant - reg["t"]
+            if dt <= 0.0 or dt > 1.0:
+                # Boucle interrompue : on repart sans memoire.
+                reg["i"] = 0.0
+                reg["rotation"] = 0.0
+                dt = None
+        if dt is not None and reg["cap"] is not None:
+            vitesse = angle_diff(cap, reg["cap"]) / dt
+            alpha = dt / (self.TAU_DERIVEE + dt)
+            reg["rotation"] += (vitesse - reg["rotation"]) * alpha
+        reg["t"] = maintenant
+        reg["cap"] = cap
+
+        u_p = self.KP_CAP * erreur
+        if dt is not None and abs(erreur) >= self.ZONE_INTEGRALE:
+            # Grand virage : la correction apprise pour l'ancien cap (couple
+            # du vent) ne vaut plus pour le nouveau, on l'oublie.
+            reg["i"] *= math.exp(-dt / self.OUBLI_INTEGRALE)
+        if dt is not None and abs(erreur) < self.ZONE_INTEGRALE:
+            reg["i"] += erreur * dt
+            if self.KI_CAP > 0.0:
+                limite = self.LIMITE_INTEGRALE / self.KI_CAP
+                reg["i"] = max(-limite, min(limite, reg["i"]))
+        u_i = self.KI_CAP * reg["i"]
+        u_d = -self.KD_CAP * reg["rotation"]
+        u_d = max(-self.LIMITE_DERIVEE, min(self.LIMITE_DERIVEE, u_d))
+        u = u_p + u_i + u_d
+        return u, {"u_p": u_p, "u_i": u_i, "u_d": u_d,
+                   "rotation": math.degrees(reg["rotation"])}
+
+    def _melanger(self, u, vitesse):
+        """Commandes gauche/droite pour une correction u autour de `vitesse`.
+
+        Quand un moteur sature, on baisse l'autre du meme montant : la
+        difference de poussee (donc la rotation) est conservee, seule la
+        vitesse diminue. L'ancien ecretage simple annulait la correction.
+        """
+        u = max(-self.COMMANDE_MAX / 2.0, min(self.COMMANDE_MAX / 2.0, u))
+        gauche = vitesse - self.SENS_ROTATION * u
+        droite = vitesse + self.SENS_ROTATION * u
+        exces = max(gauche, droite) - self.COMMANDE_MAX
+        if exces > 0:
+            gauche -= exces
+            droite -= exces
+        manque = -min(gauche, droite)
+        if manque > 0:
+            gauche += manque
+            droite += manque
+        gauche = max(0.0, min(self.COMMANDE_MAX, gauche))
+        droite = max(0.0, min(self.COMMANDE_MAX, droite))
+        return gauche, droite
+
+    def suivre_route(self, route, derive=None, vitesse=None):
+        """Applique les moteurs pour que la route sol soit `route` (cap boussole, rad).
+
+        Avec la compensation de derive, le bateau pointe a cote de la route
+        (cap de crabe) pour que le vent ne l'en ecarte pas. Retourne
+        (cap_commande, cap_actuel, moteur_gauche, moteur_droit).
+        """
+        if derive is None:
+            derive = self.COMPENSATION_DERIVE
+        if vitesse is None:
+            vitesse = self.vitesse_croisiere
+        route %= 2 * math.pi
+        current_cap = self.current_cap_rad()
+
+        crabe = 0.0
+        estimation = None
+        cap_commande = route
+        if derive:
+            cap_commande, crabe, estimation = self.derive.cap_pour_route(
+                route, time.monotonic())
+        self.derniere_route = route
+        self.dernier_cap_cible = cap_commande
+
+        erreur = angle_diff(cap_commande, current_cap)
+        u, detail = self._regulateur_cap(erreur, current_cap)
+        gauche, droite = self._melanger(u, vitesse)
+        self._commander_moteurs(gauche, droite)
+
+        detail.update({
+            "route": math.degrees(route),
+            "crabe": math.degrees(crabe),
+            "derive_active": bool(derive),
+        })
+        if estimation is not None:
+            detail.update({"derive_est": estimation["est"],
+                           "derive_nord": estimation["nord"],
+                           "s_eau": estimation["s"],
+                           "derive_n": estimation["n"],
+                           "derive_rms": estimation["rms"]})
+        self.dernier_asservissement = detail
+        return cap_commande, current_cap, gauche, droite
+
+    def maintien_cap(self, target_dir, angle_rotation=0.0, derive=None,
+                     vitesse=None):
         """Calcule et applique la vitesse des moteurs pour suivre target_dir.
 
         target_dir est un vecteur (x, y) du repere local du lac.
-        Retourne (cap_cible, cap_actuel, moteur_gauche, moteur_droit).
+        Retourne (cap_cible, cap_actuel, moteur_gauche, moteur_droit) ;
+        cap_cible est le cap commande (route + crabe si derive compensee).
         """
-        Kp = 25
-        v_base = 150
-
-        current_cap = self.current_cap_rad()
-
-        # Correction 1 : convention d'angle.
-        # current_cap_rad() est un cap boussole (0 = Nord, sens horaire),
-        # alors que atan2(y, x) donne un angle mathematique (0 = Est, sens
-        # anti-horaire). Le cap boussole d'un vecteur (Est, Nord) est
-        # atan2(Est, Nord). L'ancien calcul avait 90 deg d'ecart, et le
-        # signe "-" ajoute ensuite donnait toujours 90 deg d'ecart.
+        # Convention d'angle : current_cap_rad() est un cap boussole (0 =
+        # Nord, sens horaire), alors que atan2(y, x) donne un angle
+        # mathematique (0 = Est, sens anti-horaire). Le cap boussole d'un
+        # vecteur (Est, Nord) est atan2(Est, Nord).
         vx = float(target_dir[0])
         vy = float(target_dir[1])
         if angle_rotation != 0.0:
@@ -499,29 +730,8 @@ class DDBoat:
             nord = vx * math.sin(angle_rotation) + vy * math.cos(angle_rotation)
         else:
             est, nord = vx, vy
-        target_cap = math.atan2(est, nord) % (2 * math.pi)
-        self.dernier_cap_cible = target_cap
-
-        error = angle_diff(target_cap, current_cap)
-
-        # Asservissement proportionnel simple
-        u = Kp * error
-
-        # Correction 2 : sens de la commande.
-        # error > 0 signifie qu'il faut augmenter le cap, donc tourner a
-        # droite. L'ancien code accelerait alors le moteur droit, ce qui
-        # fait tourner a gauche : la boucle s'eloignait de la consigne et se
-        # stabilisait a l'oppose, d'ou un bateau qui part a l'oppose de la
-        # base. On reutilise SENS_ROTATION, deja valide par tour_complet() :
-        # avec SENS_ROTATION = -1, tourner a droite = moteur gauche plus
-        # rapide que le moteur droit.
-        speed_left = v_base - self.SENS_ROTATION * u
-        speed_right = v_base + self.SENS_ROTATION * u
-        speed_left = max(0, min(191, speed_left))
-        speed_right = max(0, min(191, speed_right))
-
-        self.ard.send_arduino_cmd_motor(speed_left, speed_right)
-        return target_cap, current_cap, speed_left, speed_right
+        route = math.atan2(est, nord) % (2 * math.pi)
+        return self.suivre_route(route, derive=derive, vitesse=vitesse)
 
     def homing(self, Environnement, rayon_arrivee=5.0, timeout=None,
                age_fix_max=3.0):
@@ -531,8 +741,10 @@ class DDBoat:
         """
         debut = time.monotonic()
         gps_perime = False
+        self.reinitialiser_asservissement()
         try:
             while True:
+                self._verifier_arret()
                 if timeout is not None and time.monotonic() - debut > timeout:
                     print("Homing : temps maximal depasse.")
                     self._journaliser("homing_fin", arrive=False,
@@ -576,7 +788,8 @@ class DDBoat:
                                   cap=math.degrees(cap),
                                   erreur=math.degrees(angle_diff(cible, cap)),
                                   moteurs=(gauche, droite),
-                                  mag=self.dernier_mag_brut)
+                                  mag=self.dernier_mag_brut,
+                                  **self.dernier_asservissement)
                 time.sleep(0.05)
         finally:
             # Securite : moteurs coupes a l'arrivee comme en cas d'erreur.

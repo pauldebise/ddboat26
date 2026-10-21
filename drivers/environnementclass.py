@@ -1,4 +1,3 @@
-from ddboat26.mesure_point_gps import nmea_vers_decimal
 from ddboatclass import DDBoat
 import numpy as np
 
