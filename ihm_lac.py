@@ -323,6 +323,35 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   }
   .mission-statut:empty { display: none; }
   .mission-journal { display: none; margin-top: 7px; font-size: 9.5px; color: var(--blue); }
+  .points-box { display: none; grid-template-columns: 50px 1fr auto; gap: 5px 6px; align-items: center; margin-top: 7px; }
+  .points-box label { font-size: 9.5px; color: #3c504f; }
+  .points-box button {
+    height: 24px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--line);
+    background: rgba(255,255,255,.8); color: var(--ink); font-family: var(--sans);
+    font-size: 9.5px; font-weight: 600; cursor: pointer;
+  }
+  .points-box button.on { background: var(--amber); border-color: var(--amber); color: #fff; }
+  .points-box button:disabled { opacity: .45; cursor: default; }
+  .points-aide { grid-column: 1 / -1; font-size: 9px; color: var(--muted); line-height: 1.35; }
+  .comm { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+  .comm summary {
+    cursor: pointer; font-size: 9px; font-weight: 600; letter-spacing: .095em;
+    text-transform: uppercase; user-select: none;
+  }
+  .comm-grid { display: grid; grid-template-columns: 1fr 96px; gap: 5px 8px; align-items: center; margin-top: 7px; }
+  .comm-grid label { font-size: 9.5px; color: #3c504f; line-height: 1.25; }
+  .comm-grid input { padding: 3px 5px; font-size: 10.5px; }
+  .comm-btn {
+    margin-top: 8px; width: 100%; height: 28px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--blue); color: #fff; font-family: var(--sans); font-size: 10.5px;
+    font-weight: 700; letter-spacing: .05em; cursor: pointer;
+  }
+  .comm-btn:disabled { opacity: .35; cursor: default; }
+  .comm-etat { margin-top: 6px; font-family: var(--mono); font-size: 9.3px; line-height: 1.45; color: #3c504f; white-space: pre-line; }
+  .swatch.other {
+    width: 7px; height: 8px; border-radius: 0; background: #6b4fa0;
+    clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+  }
   @media (max-width: 980px) {
     .legend { display: none; }
     .inset { width: 168px; }
@@ -380,6 +409,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <div><span>Y</span><b id="posY">&mdash;</b></div>
       <div><span>Gradient</span><b id="grad">&mdash;</b></div>
       <div><span>MAJ</span><b id="age">&mdash;</b></div>
+      <div><span>Autre</span><b id="autreLien">&mdash;</b></div>
+      <div><span>Distance</span><b id="autreDist">&mdash;</b></div>
     </div>
     <div id="latlon" class="coords">&mdash;</div>
     <div id="notice" class="notice"></div>
@@ -392,6 +423,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       <span><i class="swatch blue"></i>Bordure D.</span>
       <span><i class="swatch star"></i>Base</span>
       <span><i class="swatch boat"></i>Bateau</span>
+      <span><i class="swatch other"></i>Autre</span>
       <span><i class="gradbar"></i>Gradient</span>
     </div>
     <div class="credit">Fond de lac &copy; OpenStreetMap (ODbL)</div>
@@ -413,6 +445,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="mission-head">Missions <span id="missionEtat" class="mission-etat">en attente</span></div>
     <select id="missionSel"></select>
     <div id="missionDesc" class="mission-desc"></div>
+    <div id="missionPoints" class="points-box"></div>
     <div id="missionParams" class="mission-params"></div>
     <div class="mission-btns">
       <button id="btnLancer" type="button" class="go">LANCER</button>
@@ -420,6 +453,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="missionStatut" class="mission-statut"></div>
     <a id="missionJournal" class="mission-journal" href="/journal" target="_blank">Télécharger le journal</a>
+    <details class="comm" id="commBox">
+      <summary>Communication</summary>
+      <div class="comm-grid">
+        <label for="commIp">IP du serveur</label><input type="text" id="commIp" autocomplete="off">
+        <label for="commPort">Port</label><input type="text" id="commPort" autocomplete="off">
+        <label for="commMonId">Mon id</label><input type="text" id="commMonId" autocomplete="off">
+        <label for="commAutreId">Id de l'autre bateau</label><input type="text" id="commAutreId" autocomplete="off">
+      </div>
+      <button id="commAppliquer" type="button" class="comm-btn">APPLIQUER</button>
+      <div id="commEtat" class="comm-etat"></div>
+    </details>
   </div>
 
   <div class="hint">Molette pour zoomer &middot; glisser pour déplacer</div>
@@ -449,6 +493,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   var showField = true;
   var showTrail = true;
   var lastStateAt = 0;
+  var namedPoints = [];
+  var pickMode = null;
+  var downAt = null;
   var dragging = null;
   var pointers = {};
   var pinch = null;
@@ -463,6 +510,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     blue: '#35669b',
     base: '#a53d26',
     boat: '#d4552f',
+    other: '#6b4fa0',
+    otherLost: '#8b8f93',
     field: '#4d8093',
     ink: '#1f302f',
     muted: '#70807f'
@@ -1052,13 +1101,77 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     c.restore();
   }
 
+  function drawNamedPoints(c) {
+    if (!DATA.pilotage || !namedPoints.length || view.scale < 0.25) return;
+    c.save();
+    for (var i = 0; i < namedPoints.length; i++) {
+      var p = namedPoints[i];
+      var X = sx(p.x), Y = sy(p.y);
+      c.beginPath();
+      c.moveTo(X, Y - 4.5); c.lineTo(X + 4.5, Y); c.lineTo(X, Y + 4.5); c.lineTo(X - 4.5, Y);
+      c.closePath();
+      c.fillStyle = '#fbf9f2';
+      c.strokeStyle = COL.ink;
+      c.lineWidth = 1.4;
+      c.fill();
+      c.stroke();
+      label(c, p.nom, X, Y, 8, -7, 'left', COL.ink);
+    }
+    c.restore();
+  }
+
+  function drawAutre(c) {
+    var a = state && state.autre;
+    if (!a || a.x === null || a.x === undefined) return;
+    var perdu = a.lien !== 'ok';
+    var col = perdu ? COL.otherLost : COL.other;
+    var X = sx(a.x), Y = sy(a.y);
+    var metre = Math.abs(sx(a.x + 1) - sx(a.x));
+    c.save();
+    c.beginPath();
+    c.arc(X, Y, 15 * metre, 0, Math.PI * 2);
+    c.fillStyle = perdu ? 'rgba(139,143,147,0.07)' : 'rgba(107,79,160,0.07)';
+    c.fill();
+    c.setLineDash([7, 5]);
+    c.strokeStyle = perdu ? 'rgba(139,143,147,0.8)' : 'rgba(107,79,160,0.85)';
+    c.lineWidth = 1.6;
+    c.stroke();
+    c.beginPath();
+    c.arc(X, Y, 5 * metre, 0, Math.PI * 2);
+    c.strokeStyle = 'rgba(179,57,42,0.85)';
+    c.lineWidth = 1.4;
+    c.stroke();
+    c.setLineDash([]);
+    var h = a.heading || 0;
+    var fx = Math.cos(h), fy = -Math.sin(h);
+    var px = -fy, py = fx;
+    c.beginPath();
+    c.moveTo(X + fx * 11, Y + fy * 11);
+    c.lineTo(X - fx * 6 + px * 5.4, Y - fy * 6 + py * 5.4);
+    c.lineTo(X - fx * 3.5, Y - fy * 3.5);
+    c.lineTo(X - fx * 6 - px * 5.4, Y - fy * 6 - py * 5.4);
+    c.closePath();
+    c.fillStyle = col;
+    c.strokeStyle = '#fff';
+    c.lineWidth = 1.5;
+    c.fill();
+    c.stroke();
+    c.restore();
+    var texte = 'autre';
+    if (a.age !== null && a.age !== undefined) texte += ' \u00b7 ' + a.age.toFixed(1) + ' s';
+    if (perdu) texte += ' \u00b7 lien perdu';
+    label(c, texte, X, Y, 0, 20, 'center', col);
+  }
+
   function render() {
     if (dirty) drawStatic();
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(staticLayer, 0, 0, W, H);
     drawTrail(ctx);
+    drawNamedPoints(ctx);
     drawMission(ctx);
     drawBoat(ctx);
+    drawAutre(ctx);
     requestAnimationFrame(render);
   }
 
@@ -1129,6 +1242,35 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     }
     var notice = document.getElementById('notice');
     notice.textContent = state.notice || '';
+    updateAutre();
+  }
+
+  var LIENS = { aucune_donnee: 'aucune donn\u00e9e', non_configure: 'non configur\u00e9' };
+
+  function updateAutre() {
+    var lien = document.getElementById('autreLien');
+    var dist = document.getElementById('autreDist');
+    var a = state.autre;
+    if (!DATA.pilotage || !a) {
+      lien.textContent = '\u2014'; dist.textContent = '\u2014';
+      return;
+    }
+    if (a.lien === 'ok') {
+      lien.textContent = 'OK ' + fmt(a.age, 1) + ' s';
+      lien.style.color = COL.green;
+    } else if (a.lien === 'perdu') {
+      lien.textContent = 'PERDU ' + fmt(a.age, 1) + ' s';
+      lien.style.color = '#a13a28';
+    } else {
+      lien.textContent = LIENS[a.lien] || a.lien;
+      lien.style.color = '';
+    }
+    var b = state.boat;
+    if (b && a.x !== null && a.x !== undefined) {
+      dist.textContent = fmt(Math.sqrt(Math.pow(b.x - a.x, 2) + Math.pow(b.y - a.y, 2)), 1) + ' m';
+    } else {
+      dist.textContent = '\u2014';
+    }
   }
 
   var missions = [];
@@ -1147,11 +1289,106 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     }).then(function (r) { return r.json(); });
   }
 
+  function nomPoint(lat, lon) {
+    for (var i = 0; i < namedPoints.length; i++) {
+      if (Math.abs(namedPoints[i].lat - lat) < 1e-7 && Math.abs(namedPoints[i].lon - lon) < 1e-7) {
+        return namedPoints[i].nom;
+      }
+    }
+    return '';
+  }
+
+  function champ(nom) { return el('missionParams').querySelector('[data-nom="' + nom + '"]'); }
+
+  function majListePoint(role) {
+    var sel = el('missionPoints').querySelector('select[data-point="' + role + '"]');
+    var lat = champ(role + '_lat'), lon = champ(role + '_lon');
+    if (!sel || !lat || !lon) return;
+    sel.value = nomPoint(parseFloat(lat.value), parseFloat(lon.value));
+  }
+
+  function definirPoint(role, lat, lon) {
+    var cl = champ(role + '_lat'), co = champ(role + '_lon');
+    if (!cl || !co) return;
+    cl.value = String(lat);
+    co.value = String(lon);
+    majListePoint(role);
+    demanderApercu();
+  }
+
+  function pointDepuisClic(px, py) {
+    var x = wx(px), y = wy(py);
+    var rot = DATA.rotation || 0;
+    var dx = x * Math.cos(rot) - y * Math.sin(rot);
+    var dy = x * Math.sin(rot) + y * Math.cos(rot);
+    var lat0 = DATA.home.lat, lon0 = DATA.home.lon;
+    var R = 6371000.0;
+    return {
+      lat: lat0 + (dy / R) * 180 / Math.PI,
+      lon: lon0 + (dx / (R * Math.cos(lat0 * Math.PI / 180))) * 180 / Math.PI
+    };
+  }
+
+  function choisirMode(role) {
+    pickMode = (pickMode === role) ? null : role;
+    var boutons = el('missionPoints').querySelectorAll('button[data-pick]');
+    for (var i = 0; i < boutons.length; i++) {
+      boutons[i].classList.toggle('on', boutons[i].dataset.pick === pickMode);
+    }
+    canvas.style.cursor = pickMode ? 'crosshair' : '';
+  }
+
+  function remplirPoints() {
+    var zone = el('missionPoints');
+    zone.innerHTML = '';
+    choisirMode(null);
+    var utile = courante && champ('depart_lat') && champ('arrivee_lat');
+    zone.style.display = utile ? 'grid' : 'none';
+    if (!utile) return;
+    [['depart', 'D\u00e9part'], ['arrivee', 'Arriv\u00e9e']].forEach(function (r) {
+      var label = document.createElement('label');
+      label.textContent = r[1];
+      var sel = document.createElement('select');
+      sel.dataset.point = r[0];
+      sel.dataset.ctl = '1';
+      var libre = document.createElement('option');
+      libre.value = ''; libre.textContent = 'personnalis\u00e9';
+      sel.appendChild(libre);
+      namedPoints.forEach(function (p) {
+        var o = document.createElement('option');
+        o.value = p.nom;
+        o.textContent = p.nom;
+        if (p.description) o.title = p.description;
+        sel.appendChild(o);
+      });
+      sel.addEventListener('change', function () {
+        for (var i = 0; i < namedPoints.length; i++) {
+          if (namedPoints[i].nom === sel.value) definirPoint(r[0], namedPoints[i].lat, namedPoints[i].lon);
+        }
+      });
+      var bouton = document.createElement('button');
+      bouton.type = 'button';
+      bouton.textContent = 'Clic carte';
+      bouton.dataset.pick = r[0];
+      bouton.dataset.ctl = '1';
+      bouton.addEventListener('click', function () { choisirMode(r[0]); });
+      zone.appendChild(label);
+      zone.appendChild(sel);
+      zone.appendChild(bouton);
+      majListePoint(r[0]);
+    });
+    var aide = document.createElement('div');
+    aide.className = 'points-aide';
+    aide.textContent = "L'arriv\u00e9e est le point de d\u00e9part de l'autre bateau. " +
+      'Les champs lat/lon restent modifiables.';
+    zone.appendChild(aide);
+  }
+
   function remplirParametres() {
     var zone = el('missionParams');
     zone.innerHTML = '';
     el('missionDesc').textContent = courante ? courante.description : '';
-    if (!courante) return;
+    if (!courante) { remplirPoints(); return; }
     courante.parametres.forEach(function (p) {
       var label = document.createElement('label');
       label.textContent = p.label;
@@ -1170,12 +1407,25 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         champ.value = p.defaut;
       }
       champ.dataset.nom = p.nom;
-      champ.addEventListener('input', demanderApercu);
-      champ.addEventListener('change', demanderApercu);
+      champ.addEventListener('input', function () {
+        if (/^(depart|arrivee)_(lat|lon)$/.test(p.nom)) majListePoint(p.nom.split('_')[0]);
+        demanderApercu();
+      });
+      champ.addEventListener('change', function () { majModePoints(); demanderApercu(); });
       zone.appendChild(label);
       zone.appendChild(champ);
     });
+    remplirPoints();
+    majModePoints();
     demanderApercu();
+  }
+
+  function majModePoints() {
+    var mode = champ('points');
+    var auto = !!mode && mode.value === 'auto';
+    el('missionPoints').style.opacity = auto ? '0.4' : '';
+    var ids = ['depart_lat', 'depart_lon', 'arrivee_lat', 'arrivee_lon'];
+    ids.forEach(function (n) { var c = champ(n); if (c) c.style.opacity = auto ? '0.4' : ''; });
   }
 
   function parametresSaisis() {
@@ -1202,7 +1452,11 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   function initMissions() {
     if (!DATA.pilotage) return;
     el('missionCard').style.display = 'block';
-    fetch('/api/missions').then(function (r) { return r.json(); }).then(function (liste) {
+    fetch('/api/points').then(function (r) { return r.json(); })
+      .then(function (liste) { namedPoints = liste; })
+      .catch(function () { namedPoints = []; })
+      .then(function () { return fetch('/api/missions'); })
+      .then(function (r) { return r.json(); }).then(function (liste) {
       missions = liste;
       var sel = el('missionSel');
       liste.forEach(function (m, i) {
@@ -1221,14 +1475,49 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       if (!courante) return;
       var v = parametresSaisis();
       var attente = v.attente !== undefined ? v.attente : '?';
+      var avertissement = '';
+      if (courante.nom === 'abba' && !(state && state.autre && state.autre.lien === 'ok')) {
+        avertissement = '\n\nATTENTION : l\'autre bateau n\'est pas vu (lien ' +
+          ((state && state.autre && LIENS[state.autre.lien]) || (state && state.autre && state.autre.lien) || '?') +
+          '). La mission attendra sa position pendant 60 s.';
+      }
       if (!window.confirm(courante.titre + '\n\nLe bateau va demarrer dans ' + attente +
-          ' s. Verifier la zone d\'eau libre et rester pret a appuyer sur ARRET.')) return;
+          ' s. Verifier la zone d\'eau libre et rester pret a appuyer sur ARRET.' + avertissement)) return;
       postJson('/api/mission/start', { nom: courante.nom, params: v }).then(function (r) {
         if (!r.ok) window.alert(r.message || 'Lancement refuse');
       });
     });
     el('btnStop').addEventListener('click', function () {
       postJson('/api/mission/stop', {});
+    });
+  }
+
+  var commSaisie = false;
+
+  function remplirComm(c) {
+    el('commIp').value = c.ip;
+    el('commPort').value = c.port;
+    el('commMonId').value = c.mon_id;
+    el('commAutreId').value = c.autre_id;
+  }
+
+  function initComm() {
+    if (!DATA.pilotage) return;
+    fetch('/api/communication').then(function (r) { return r.json(); }).then(remplirComm);
+    el('commAppliquer').addEventListener('click', function () {
+      postJson('/api/communication', {
+        ip: el('commIp').value, port: el('commPort').value,
+        mon_id: el('commMonId').value, autre_id: el('commAutreId').value
+      }).then(function (r) {
+        commSaisie = true;
+        if (r.ok) {
+          remplirComm(r.config);
+          el('commEtat').textContent = 'Enregistr\u00e9.';
+        } else {
+          el('commEtat').textContent = 'Refus\u00e9 : ' + (r.message || '?');
+        }
+        setTimeout(function () { commSaisie = false; }, 4000);
+      });
     });
   }
 
@@ -1245,6 +1534,10 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     el('missionSel').disabled = actif;
     var champs = el('missionParams').querySelectorAll('[data-nom]');
     for (var i = 0; i < champs.length; i++) champs[i].disabled = actif;
+    var controles = el('missionPoints').querySelectorAll('[data-ctl]');
+    for (var j = 0; j < controles.length; j++) controles[j].disabled = actif;
+    if (actif && pickMode) choisirMode(null);
+    el('commAppliquer').disabled = actif;
 
     var lignes = [];
     if (state.phase_texte && (actif || etat !== 'veille')) {
@@ -1264,7 +1557,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     }
     if (state.derive) lignes.push('Derive estimee ' + state.derive.vitesse.toFixed(2) + ' m/s vers ' + state.derive.cap.toFixed(0) + '°');
     if (state.moteurs) lignes.push('Moteurs ' + state.moteurs[0] + ' / ' + state.moteurs[1]);
+    var autre = state.autre;
+    if (autre && (autre.lien !== 'non_configure' || actif)) {
+      var l = 'Autre bateau (id ' + autre.id + ') : ' + (LIENS[autre.lien] || autre.lien);
+      if (autre.age !== null && autre.age !== undefined) l += ', paquet de ' + autre.age.toFixed(1) + ' s';
+      lignes.push(l);
+    }
     el('missionStatut').textContent = lignes.join('\n');
+    var etat = [];
+    if (autre && autre.erreur) etat.push('Erreur : ' + autre.erreur);
+    if (autre && autre.lien === 'non_configure') etat.push("Serveur non configur\u00e9 : renseigner l'IP.");
+    if (!commSaisie) el('commEtat').textContent = etat.join('\n');
     el('missionJournal').style.display = state.journal ? 'block' : 'none';
   }
 
@@ -1308,6 +1611,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   canvas.addEventListener('pointerdown', function (e) {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     canvas.setPointerCapture(e.pointerId);
+    downAt = { x: e.clientX, y: e.clientY };
     pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
     var ids = Object.keys(pointers);
     if (ids.length === 1) {
@@ -1368,7 +1672,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       pinch = null;
     }
   }
-  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointerup', function (e) {
+    if (pickMode && downAt && Math.abs(e.clientX - downAt.x) < 5 && Math.abs(e.clientY - downAt.y) < 5) {
+      var r = canvas.getBoundingClientRect();
+      var pt = pointDepuisClic(e.clientX - r.left, e.clientY - r.top);
+      definirPoint(pickMode, pt.lat.toFixed(7), pt.lon.toFixed(7));
+      choisirMode(null);
+    }
+    downAt = null;
+    endPointer(e);
+  });
   canvas.addEventListener('pointercancel', endPointer);
 
   canvas.addEventListener('dblclick', function () { fitView(); });
@@ -1409,6 +1722,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   if (DATA.mode === 'live') document.getElementById('statusPill').className = 'pill live';
 
   initMissions();
+  initComm();
   resize();
   requestAnimationFrame(render);
   tickClock();
@@ -1468,6 +1782,32 @@ def charger_rivage(env):
         x, y = convertisseur.convert_cart_position(
             float(lat), float(lon), env.home_latlong, env.rotation)
         points.append([float(x), float(y)])
+    return points
+
+
+def charger_points_nommes(env):
+    """Points de points.json avec leur position locale : [{nom, lat, lon, x, y}]."""
+    if str(DRIVERS_DIR) not in sys.path:
+        sys.path.insert(0, str(DRIVERS_DIR))
+    import ddboatclass
+
+    convertisseur = ddboatclass.DDBoat(None, None, None)
+    try:
+        with open(str(BASE_DIR / "points.json"), encoding="utf-8") as fichier:
+            brut = json.load(fichier)["points"]
+    except (OSError, ValueError, KeyError):
+        return []
+    points = []
+    for p in brut:
+        try:
+            lat, lon = float(p["lat"]), float(p["lon"])
+            x, y = convertisseur.convert_cart_position(
+                lat, lon, env.home_latlong, env.rotation)
+            points.append({"nom": str(p["nom"]), "lat": lat, "lon": lon,
+                           "x": _arrondi(x, 2), "y": _arrondi(y, 2),
+                           "description": str(p.get("description", ""))})
+        except (KeyError, TypeError, ValueError):
+            continue
     return points
 
 
@@ -1866,6 +2206,7 @@ class MissionBoat(object):
             "cap_cible": p.get("cap_cible"),
             "moteurs": p.get("moteurs"),
             "journal": p.get("journal"),
+            "autre": p.get("autre"),
         }
         if p.get("x") is None:
             etat.update({"boat": None, "age": None, "stale": True})
@@ -1943,6 +2284,7 @@ class Handler(BaseHTTPRequestHandler):
     page = b""
     app_state = None
     session = None
+    env = None
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -1962,6 +2304,10 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/missions":
             liste = self.session.description_missions() if self.session else []
             self._envoyer_json(200, liste)
+        elif route == "/api/points":
+            self._envoyer_json(200, charger_points_nommes(self.env))
+        elif route == "/api/communication" and self.session is not None:
+            self._envoyer_json(200, self.session.configuration_communication())
         elif route == "/api/apercu" and self.session is not None:
             demande = {cle: valeurs[0] for cle, valeurs in parse_qs(
                 url.query, keep_blank_values=True).items()}
@@ -2020,6 +2366,13 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/mission/stop":
             self.session.arreter()
             self._envoyer_json(200, {"ok": True})
+        elif route == "/api/communication":
+            try:
+                config = self.session.configurer_communication(donnees)
+            except (ValueError, RuntimeError) as exc:
+                self._envoyer_json(400, {"ok": False, "message": str(exc)})
+                return
+            self._envoyer_json(200, {"ok": True, "config": config})
         else:
             self._envoyer_json(404, {"ok": False, "message": "inconnu"})
 
@@ -2212,6 +2565,7 @@ def main(argv=None):
     Handler.page = page.encode("utf-8")
     Handler.app_state = app_state
     Handler.session = session
+    Handler.env = env
 
     try:
         serveur = Serveur((args.host, args.port), Handler)

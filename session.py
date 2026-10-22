@@ -33,10 +33,20 @@ BASE_DIR = Path(__file__).resolve().parent
 DRIVERS_DIR = BASE_DIR / "drivers"
 if str(DRIVERS_DIR) not in sys.path:
     sys.path.insert(0, str(DRIVERS_DIR))
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 from ddboatclass import DDBoat, ArretDemande, angle_diff, dist_cart  # noqa: E402
+import communication  # noqa: E402  (client UDP du serveur du lac, fige)
 
 AGE_FIX_MAX = 3.0  # au-dela, la position GPS est consideree perimee (s)
+
+# Communication avec l'autre bateau (voir Session._boucle_communication).
+COMM_DEFAUT = {"ip": "", "port": 6800, "mon_id": 3, "autre_id": 4}
+PERIODE_ENVOI = 1.0     # envoi de notre position (s)
+PERIODE_LECTURE = 0.2   # relecture de l'etat des bateaux (s)
+AGE_LIEN_MAX = 3.0      # au-dela, le lien avec l'autre bateau est affiche perdu (s)
+DIST_AUTRE_MAX = 200.0  # une position a plus de ... m de la base est rejetee
 
 
 # ----------------------------------------------------------------------
@@ -215,12 +225,18 @@ class Session(object):
         "NAVIGATION": "Navigation",
         "MAINTIEN": "Maintien de position",
         "RALLIEMENT": "Retour dans la zone",
+        "ATTENTE_AUTRE": "Attente de l'autre bateau",
+        "EVITEMENT": "Evitement de l'autre bateau",
+        "BUT_OCCUPE": "But occupe : attente",
+        "ARRET_URGENCE": "Arret d'urgence (autre bateau trop proche)",
+        "LIEN_PERDU": "Lien perdu avec l'autre bateau",
         "TERMINE": "Mission terminee",
         "ECHEC": "Echec",
         "ARRET": "Arret",
     }
 
-    def __init__(self, env, gps=0, simulation=None, dossier_logs=None):
+    def __init__(self, env, gps=0, simulation=None, dossier_logs=None,
+                 fichier_comm=None):
         self.env = env
         self.gps_index = gps
         self.simulation = simulation
@@ -248,6 +264,16 @@ class Session(object):
         self._thread_materiel = None
         self._gps = None
         self.convertisseur = DDBoat(None, None, None)
+        # Communication avec l'autre bateau : etat partage entre le thread de
+        # communication, les missions et l'IHM, protege par _verrou_comm.
+        self.fichier_comm = (Path(fichier_comm) if fichier_comm
+                             else BASE_DIR / "communication.json")
+        self._verrou_comm = threading.Lock()
+        self._config_comm = self._lire_config_communication()
+        self._autre = None
+        self._erreur_comm = None
+        self._derniere_erreur_comm = None
+        self._thread_comm = None
 
     @staticmethod
     def _info_vide():
@@ -338,11 +364,18 @@ class Session(object):
             target=self._boucle_materiel, name="materiel")
         self._thread_materiel.daemon = True
         self._thread_materiel.start()
+        # La communication tourne des le demarrage, en veille comme en mission.
+        self._thread_comm = threading.Thread(
+            target=self._boucle_communication, name="communication")
+        self._thread_comm.daemon = True
+        self._thread_comm.start()
 
     def fermer_materiel(self):
         self._stop_materiel = True
         if self._thread_materiel is not None:
             self._thread_materiel.join(timeout=1.0)
+        if self._thread_comm is not None:
+            self._thread_comm.join(timeout=1.0)
         if self.ddb is not None:
             try:
                 self.ddb._arreter_moteurs()
@@ -420,6 +453,179 @@ class Session(object):
             journal.ecrire(type_evenement, donnees)
 
     # ------------------------------------------------------------------
+    # Communication avec l'autre bateau
+    # ------------------------------------------------------------------
+    @staticmethod
+    def valider_config_communication(brut):
+        """Configuration {ip, port, mon_id, autre_id} validee, ou ValueError."""
+        brut = brut or {}
+        ip = str(brut.get("ip", COMM_DEFAUT["ip"])).strip()
+        if len(ip) > 253 or any(c.isspace() for c in ip):
+            raise ValueError("adresse du serveur invalide")
+        try:
+            port = int(float(brut.get("port", COMM_DEFAUT["port"])))
+            mon_id = int(float(brut.get("mon_id", COMM_DEFAUT["mon_id"])))
+            autre_id = int(float(brut.get("autre_id", COMM_DEFAUT["autre_id"])))
+        except (TypeError, ValueError):
+            raise ValueError("port et identifiants : nombres entiers attendus")
+        if not 1 <= port <= 65535:
+            raise ValueError("port invalide (1 a 65535)")
+        if mon_id < 0 or autre_id < 0:
+            raise ValueError("identifiant invalide")
+        if mon_id == autre_id:
+            raise ValueError("mon identifiant et celui de l'autre bateau sont identiques")
+        return {"ip": ip, "port": port, "mon_id": mon_id, "autre_id": autre_id}
+
+    def _lire_config_communication(self):
+        try:
+            with open(str(self.fichier_comm), encoding="utf-8") as fichier:
+                return self.valider_config_communication(json.load(fichier))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            print("Configuration de communication ignoree ({}) : {}".format(
+                self.fichier_comm.name, exc))
+        return dict(COMM_DEFAUT)
+
+    def configuration_communication(self):
+        with self._verrou_comm:
+            return dict(self._config_comm)
+
+    def configurer_communication(self, brut):
+        """Applique et enregistre la configuration, sans redemarrer le programme."""
+        config = self.valider_config_communication(brut)
+        if self.en_cours:
+            raise RuntimeError("une mission est en cours : reglages verrouilles")
+        with self._verrou_comm:
+            ancienne = self._config_comm
+            self._config_comm = config
+            if (config["ip"], config["autre_id"]) != (ancienne["ip"], ancienne["autre_id"]):
+                self._autre = None
+            self._erreur_comm = None
+            self._derniere_erreur_comm = None
+        try:
+            temporaire = self.fichier_comm.with_name(self.fichier_comm.name + ".tmp")
+            with open(str(temporaire), "w", encoding="utf-8") as fichier:
+                json.dump(config, fichier, indent=2)
+            os.replace(str(temporaire), str(self.fichier_comm))
+        except OSError as exc:
+            print("Configuration de communication non enregistree : {}".format(exc))
+        return config
+
+    def _boucle_communication(self):
+        """Envoie notre position (1 Hz) et relit celle de l'autre bateau.
+
+        Elle ne bloque jamais une mission : toute erreur est notee et la
+        boucle continue. Le client communication.py est utilise tel quel.
+        """
+        dernier_envoi = None
+        while not self._stop_materiel:
+            with self._verrou_comm:
+                config = dict(self._config_comm)
+            if config["ip"]:
+                maintenant = time.monotonic()
+                if dernier_envoi is None or maintenant - dernier_envoi >= PERIODE_ENVOI:
+                    dernier_envoi = maintenant
+                    try:
+                        self._envoyer_position(config)
+                    except Exception as exc:
+                        self._signaler_erreur_comm("envoi", exc)
+                try:
+                    self._lire_autre(config, maintenant)
+                except Exception as exc:
+                    self._signaler_erreur_comm("lecture", exc)
+            time.sleep(PERIODE_LECTURE)
+
+    def _envoyer_position(self, config):
+        ddb = self.ddb
+        if ddb is None or ddb.derniere_position_gps is None:
+            return
+        age = ddb.age_fix_gps()
+        if age is None or age > AGE_FIX_MAX:
+            # Un fix perime ne part pas : l'autre bateau verrait l'age du
+            # paquet, pas celui du fix, et se fierait a une position fausse.
+            return
+        lat, lon = ddb.derniere_position_gps
+        cap = ddb.dernier_cap
+        communication.send_position(
+            config["ip"], config["port"], config["mon_id"], lat, lon,
+            math.degrees(cap) if cap is not None else 0.0)
+        with self._verrou_comm:
+            self._erreur_comm = None
+
+    def _lire_autre(self, config, maintenant):
+        """Filtre get_boats() : seul l'autre bateau, avec des valeurs plausibles."""
+        bateau = communication.get_boats().get(config["autre_id"])
+        if bateau is None:
+            return
+        try:
+            lat = float(bateau["lat"])
+            lon = float(bateau["lon"])
+            cap = float(bateau["cap"])
+            age = float(bateau["age"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not all(math.isfinite(v) for v in (lat, lon, cap, age)):
+            return
+        if abs(lat) > 90.0 or abs(lon) > 180.0 or not 0.0 <= cap <= 360.0:
+            return
+        x, y = self.convertisseur.convert_cart_position(
+            lat, lon, self.env.home_latlong, self.env.rotation)
+        if math.hypot(x, y) > DIST_AUTRE_MAX:
+            return
+        with self._verrou_comm:
+            self._autre = {"id": config["autre_id"], "lat": lat, "lon": lon,
+                           "cap": cap % 360.0, "x": float(x), "y": float(y),
+                           "age_lu": max(0.0, age), "t_lu": maintenant}
+
+    def _signaler_erreur_comm(self, etape, exc):
+        texte = "{} : {}".format(etape, exc)
+        with self._verrou_comm:
+            self._erreur_comm = texte
+            nouvelle = texte != self._derniere_erreur_comm
+            self._derniere_erreur_comm = texte
+        if nouvelle:
+            self.ecrire_journal("erreur_communication", {"erreur": texte})
+
+    def etat_autre(self):
+        """Dernier etat valide de l'autre bateau, ou None s'il n'a jamais ete vu.
+
+        C'est une copie ; "age" est l'age du paquet recu plus le temps ecoule
+        depuis notre lecture. Ce n'est pas l'age du fix GPS de l'autre bateau.
+        """
+        with self._verrou_comm:
+            base = self._autre
+            if base is None:
+                return None
+            copie = dict(base)
+        copie["age"] = copie["age_lu"] + max(0.0, time.monotonic() - copie["t_lu"])
+        return copie
+
+    def _etat_autre_ihm(self):
+        """Etat de l'autre bateau pour l'IHM : toujours un dict, avec le lien."""
+        with self._verrou_comm:
+            config = dict(self._config_comm)
+            erreur = self._erreur_comm
+        autre = self.etat_autre()
+        etat = {"id": config["autre_id"], "lien": "ok", "age": None, "x": None,
+                "y": None, "lat": None, "lon": None, "cap": None,
+                "heading": None, "erreur": erreur}
+        if not config["ip"]:
+            etat["lien"] = "non_configure"
+        elif autre is None:
+            etat["lien"] = "aucune_donnee"
+        else:
+            etat.update({
+                "age": autre["age"], "x": autre["x"], "y": autre["y"],
+                "lat": autre["lat"], "lon": autre["lon"], "cap": autre["cap"],
+                "heading": (math.pi / 2 - math.radians(autre["cap"])
+                            - self.env.rotation),
+            })
+            if autre["age"] > AGE_LIEN_MAX:
+                etat["lien"] = "perdu"
+        return etat
+
+    # ------------------------------------------------------------------
     # Etat partage avec l'IHM
     # ------------------------------------------------------------------
     def definir_phase(self, phase, message=""):
@@ -466,6 +672,15 @@ class Session(object):
     def chemin_journal_courant(self):
         return self.chemin_journal
 
+    def _nom_journal(self):
+        """Chemin du journal affiche par l'IHM (relatif au depot s'il y est)."""
+        if not self.chemin_journal:
+            return None
+        try:
+            return str(self.chemin_journal.relative_to(BASE_DIR))
+        except ValueError:
+            return str(self.chemin_journal)
+
     def etat(self):
         """Etat courant pour l'IHM (appele depuis le thread du serveur)."""
         with self.verrou:
@@ -490,12 +705,12 @@ class Session(object):
             "heading": (math.pi / 2 - cap - self.env.rotation) if cap is not None else None,
             "moteurs": self._moteurs(),
             "trail": trail,
-            "journal": (str(self.chemin_journal.relative_to(BASE_DIR))
-                        if self.chemin_journal else None),
+            "journal": self._nom_journal(),
             "mission": info,
             "guidage": guidage,
             "derive": None,
             "vitesse_sol": None,
+            "autre": self._etat_autre_ihm(),
         }
         if ddb is not None:
             estimation = ddb.derive.estimer(time.monotonic())

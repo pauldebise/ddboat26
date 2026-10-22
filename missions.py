@@ -14,7 +14,8 @@ Mission :
 - polygone    : parcourt un polygone defini dans polygone.json, avec le
                 gradient de ligne (segment courant) et le gradient ponctuel
                 (sommet vise) ;
-- mission3, stationkeeping : voir leurs classes.
+- mission3, stationkeeping : voir leurs classes ;
+- abba : voir mission_communication.py.
 
 Chaque mission ecrit son journal dans logs/ (voir session.py). Les essais
 logguent en plus un evenement de bilan par cap ou par segment.
@@ -28,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from ddboatclass import angle_diff
+from mission_communication import MissionABBA
 from mission_d1 import MissionD1
 from navigation import SuiveurChemin, construire_chemin_ferme, point_a_distance
 from session import BASE_DIR, Mission
@@ -661,7 +663,7 @@ class StationKeeping(_MissionNavigation):
 
 
 MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone, Mission3,
-            StationKeeping]
+            StationKeeping, MissionABBA]
 
 
 def enregistrer_missions(session):

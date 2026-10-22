@@ -56,3 +56,6 @@ maps/
 .env.*
 !.env.example
 secrets/
+# Reglages de communication propres a chaque bateau (IP du serveur, ids)
+communication.json
+communication.json.tmp

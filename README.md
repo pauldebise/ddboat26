@@ -27,7 +27,27 @@ aussi les moteurs.
 | Mission : polygone | Parcourt le polygone de `polygone.json` (gradient de ligne + gradient ponctuel) |
 | Mission 3 | Trajet A-C-D-G'-E-F-G-A de `mission3.json`, termine à A en ralentissant pour s'arrêter avant le ponton |
 | Station keeping | Reste autour du point G, sans fin : moteurs coupés dans la grande zone (5 m), retour lent sans marche arrière dans la petite (2 m) |
+| Mission ABBA | Rejoint le point de départ de l'autre bateau en l'évitant (positions échangées par le serveur UDP du lac) : voir ci-dessous |
 | Mission D1 | Aller vers D1, tour complet, retour par le couloir |
+
+### Mission ABBA
+
+Deux bateaux échangent leur position à 1 Hz par le serveur UDP du lac
+(`communication.py`) et rejoignent chacun le point de départ de l'autre. Le
+panneau **Communication** de l'IHM règle l'IP du serveur, le port, l'id du
+bateau et celui de l'autre (enregistrés dans `communication.json`, propre à
+chaque bateau). La communication tourne dès le démarrage : l'autre bateau, son
+âge, le cercle de 15 m et l'état du lien s'affichent même en veille.
+
+Avec `points = auto`, le départ est ma position GPS au lancement et l'arrivée la position de l'autre bateau à cet instant. Sinon, départ et arrivée se choisissent dans les listes (points de `points.json`) ou
+d'un clic sur la carte (bouton **Clic carte**). Pendant la mission : répulsion
+de l'autre bateau dans 15 m, ralentissement, arrêt d'urgence sous 5 m (reprise
+au-delà de 8 m), arrêt si sa position a plus de 3 s ou est absente, attente à
+10 m du but s'il est occupé. Journal : événements `evitement_debut/fin`,
+`arret_urgence`, `lien_perdu`, `but_occupe`, `arrivee`, `bilan`.
+
+`python3 test_fantome.py` rejoue la mission contre un bateau fantôme, sans
+matériel (voir l'en-tête du script pour les scénarios).
 
 Le polygone se décrit dans `polygone.json` (voir `polygone.exemple.json`),
 en coordonnées GPS (`points_latlon`) ou en mètres (`points_xy`).
@@ -43,7 +63,7 @@ biaisé), avec ses journaux dans `logs/simulation/`.
 Organisation du code :
 
 - `session.py` : matériel, état partagé avec l'IHM, journal, exécution des missions ;
-- `mission_d1.py`, `missions.py` : les missions et essais ;
+- `mission_d1.py`, `mission_communication.py`, `missions.py` : les missions et essais ;
 - `drivers/ddboatclass.py` : régulateur de cap (PID) et compensation de dérive ;
 - `drivers/derive.py` : estimation de la dérive à partir du GPS ;
 - `drivers/navigation.py` : gradient de ligne et gradient ponctuel ;

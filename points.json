@@ -1,0 +1,13 @@
+{
+  "commentaire": "Points nommes proposes par l'IHM (listes Depart et Arrivee de la mission communication). Coordonnees fournies par les groupes : ne pas les recaler.",
+  "points": [
+    {"nom": "A", "lat": 48.198863, "lon": -3.015070, "description": "base (ponton)"},
+    {"nom": "B", "lat": 48.199072, "lon": -3.016258, "description": "entree du couloir"},
+    {"nom": "C", "lat": 48.198124, "lon": -3.015355},
+    {"nom": "D", "lat": 48.198259, "lon": -3.017114},
+    {"nom": "G'", "lat": 48.199027, "lon": -3.015887},
+    {"nom": "E", "lat": 48.199628, "lon": -3.016379},
+    {"nom": "F", "lat": 48.199688, "lon": -3.015158},
+    {"nom": "G", "lat": 48.198944, "lon": -3.015478, "description": "point du station keeping"}
+  ]
+}
