@@ -6,10 +6,10 @@ L'interface s'ouvre dans un navigateur (locale ou distante) et affiche :
 
 - le plan d'eau du Lac de Guerledan dans le repere local de la base ;
 - les six points du couloir et des bordures ;
-- la position du bateau (simulation ou GPS) ;
-- le champ de gradient calcule par Environnement.direction() ;
-- avec --bateau ou --mission : le panneau Missions (lancement, arret,
-  chemin prevu, segment suivi, ecart lateral, derive estimee).
+- la position du bateau (simulation ou GPS) et sa trace ;
+- avec --bateau : la trace de l'autre bateau et le panneau Missions
+  (lancement, arret, chemin prevu, points de capture/retour, derive estimee) ;
+- le champ de gradient calcule par Environnement.direction().
 
 Usages
 ------
@@ -40,12 +40,13 @@ Usages
 Journaux
 --------
 Chaque mission ecrit logs/<mission>_AAAAMMJJ_HHMMSS.jsonl (logs/simulation/
-en simulation), telechargeable sur http://<IP_BATEAU>:8000/journal.
+en simulation), telechargeable sur http://<IP_BATEAU>:8000/journal, et un
+KML de la trace a cote, telechargeable sur http://<IP_BATEAU>:8000/kml.
 
 Commandes
 ---------
 Molette ou pincement : zoom ; glisser : deplacer.
-Touches 0 / L : revoir les points / le lac complet ; F : champ ; T : trace.
+Touches 0 / L : revoir les points / le lac complet ; F : champ ; T : traces.
 
 Le script ne modifie aucun fichier existant. Le fond de lac est derive
 d'OpenStreetMap (way 348334456, Lac de Guerledan), (c) OpenStreetMap
@@ -432,7 +433,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   <div class="controls">
     <div class="control-card">
       <label class="toggle"><input type="checkbox" id="showField" checked><span class="box"></span>Champ</label>
-      <label class="toggle"><input type="checkbox" id="showTrail" checked><span class="box"></span>Trace</label>
+      <label class="toggle"><input type="checkbox" id="showTrail" checked><span class="box"></span>Traces</label>
     </div>
     <div class="zoom">
       <button id="zoomIn" type="button" title="Zoomer (+)" aria-label="Zoomer">+</button>
@@ -453,6 +454,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div id="missionStatut" class="mission-statut"></div>
     <a id="missionJournal" class="mission-journal" href="/journal" target="_blank">Télécharger le journal</a>
+    <a id="missionKml" class="mission-journal" href="/kml" target="_blank">Télécharger le KML</a>
     <details class="comm" id="commBox">
       <summary>Communication</summary>
       <div class="comm-grid">
@@ -960,24 +962,43 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     c.restore();
   }
 
+  function drawTrailAutre(c) {
+    if (!showTrail || view.scale < 0.5 || !state || !state.trail_autre || state.trail_autre.length < 2) return;
+    var t = state.trail_autre;
+    c.save();
+    c.beginPath();
+    for (var i = 0; i < t.length; i++) {
+      var X = sx(t[i][0]), Y = sy(t[i][1]);
+      if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+    }
+    c.strokeStyle = 'rgba(107,79,160,0.32)';
+    c.lineWidth = 1.6;
+    c.lineJoin = 'round';
+    c.lineCap = 'round';
+    c.stroke();
+    c.restore();
+  }
+
   function drawMission(c) {
     if (!state) return;
     var m = state.mission || {};
     var actif = m.etat === 'en_cours' || m.etat === 'demandee';
     var g = state.guidage || null;
     var chemin = actif ? (g && g.chemin) : apercu;
-    if (chemin && chemin.length > 1) {
+    if (chemin && chemin.length) {
       c.save();
-      c.beginPath();
-      for (var i = 0; i < chemin.length; i++) {
-        var X = sx(chemin[i][0]), Y = sy(chemin[i][1]);
-        if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+      if (chemin.length > 1) {
+        c.beginPath();
+        for (var i = 0; i < chemin.length; i++) {
+          var X = sx(chemin[i][0]), Y = sy(chemin[i][1]);
+          if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+        }
+        c.setLineDash([7, 5]);
+        c.strokeStyle = 'rgba(191,122,33,0.85)';
+        c.lineWidth = 1.6;
+        c.stroke();
+        c.setLineDash([]);
       }
-      c.setLineDash([7, 5]);
-      c.strokeStyle = 'rgba(191,122,33,0.85)';
-      c.lineWidth = 1.6;
-      c.stroke();
-      c.setLineDash([]);
       c.fillStyle = '#fff';
       c.strokeStyle = COL.amber;
       c.lineWidth = 1.6;
@@ -1167,6 +1188,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     if (dirty) drawStatic();
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(staticLayer, 0, 0, W, H);
+    drawTrailAutre(ctx);
     drawTrail(ctx);
     drawNamedPoints(ctx);
     drawMission(ctx);
@@ -1304,15 +1326,25 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     var sel = el('missionPoints').querySelector('select[data-point="' + role + '"]');
     var lat = champ(role + '_lat'), lon = champ(role + '_lon');
     if (!sel || !lat || !lon) return;
+    var mode = champ('retour_mode');
+    if (role === 'retour' && mode && mode.value === 'depart') {
+      sel.value = '__depart__';
+      return;
+    }
     sel.value = nomPoint(parseFloat(lat.value), parseFloat(lon.value));
   }
 
   function definirPoint(role, lat, lon) {
     var cl = champ(role + '_lat'), co = champ(role + '_lon');
     if (!cl || !co) return;
+    if (role === 'retour') {
+      var mode = champ('retour_mode');
+      if (mode) mode.value = 'point';
+    }
     cl.value = String(lat);
     co.value = String(lon);
     majListePoint(role);
+    majModePoints();
     demanderApercu();
   }
 
@@ -1342,18 +1374,27 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     var zone = el('missionPoints');
     zone.innerHTML = '';
     choisirMode(null);
-    var utile = courante && champ('depart_lat') && champ('arrivee_lat');
-    zone.style.display = utile ? 'grid' : 'none';
-    if (!utile) return;
-    [['depart', 'D\u00e9part'], ['arrivee', 'Arriv\u00e9e']].forEach(function (r) {
+    var capture = !!(courante && champ('bouee_lat') && champ('retour_lat'));
+    var cible = !!(courante && champ('cible_lat') && champ('cible_lon'));
+    var abba = !!(courante && champ('depart_lat') && champ('arrivee_lat'));
+    var roles = capture ? [['bouee', 'Bou\u00e9e'], ['retour', 'Retour']]
+                        : (cible ? [['cible', 'Point']]
+                                 : (abba ? [['depart', 'D\u00e9part'],
+                                            ['arrivee', 'Arriv\u00e9e']] : []));
+    zone.style.display = roles.length ? 'grid' : 'none';
+    if (!roles.length) return;
+    roles.forEach(function (r) {
       var label = document.createElement('label');
       label.textContent = r[1];
       var sel = document.createElement('select');
       sel.dataset.point = r[0];
       sel.dataset.ctl = '1';
-      var libre = document.createElement('option');
-      libre.value = ''; libre.textContent = 'personnalis\u00e9';
-      sel.appendChild(libre);
+      if (capture && r[0] === 'retour') {
+        var depart = document.createElement('option');
+        depart.value = '__depart__';
+        depart.textContent = 'D\u00e9part de la mission (milieu)';
+        sel.appendChild(depart);
+      }
       namedPoints.forEach(function (p) {
         var o = document.createElement('option');
         o.value = p.nom;
@@ -1361,9 +1402,27 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
         if (p.description) o.title = p.description;
         sel.appendChild(o);
       });
+      var libre = document.createElement('option');
+      libre.value = ''; libre.textContent = 'personnalis\u00e9';
+      sel.appendChild(libre);
       sel.addEventListener('change', function () {
+        if (capture && r[0] === 'retour' && sel.value === '__depart__') {
+          var mode = champ('retour_mode');
+          if (mode) mode.value = 'depart';
+          majModePoints();
+          demanderApercu();
+          return;
+        }
+        if (capture && r[0] === 'retour') {
+          var modePoint = champ('retour_mode');
+          if (modePoint) modePoint.value = 'point';
+        }
         for (var i = 0; i < namedPoints.length; i++) {
           if (namedPoints[i].nom === sel.value) definirPoint(r[0], namedPoints[i].lat, namedPoints[i].lon);
+        }
+        if (!sel.value) {
+          majModePoints();
+          demanderApercu();
         }
       });
       var bouton = document.createElement('button');
@@ -1379,8 +1438,17 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     });
     var aide = document.createElement('div');
     aide.className = 'points-aide';
-    aide.textContent = "L'arriv\u00e9e est le point de d\u00e9part de l'autre bateau. " +
-      'Les champs lat/lon restent modifiables.';
+    if (capture) {
+      aide.textContent = "Bou\u00e9e : point \u00e0 capturer (m\u00eame point sur les " +
+        "deux bateaux). Retour : le milieu au lancement, un point connu, ou un " +
+        'clic sur la carte. Les champs lat/lon restent modifiables.';
+    } else if (cible) {
+      aide.textContent = "Point \u00e0 rejoindre : un point connu de points.json " +
+        'ou un clic sur la carte. Les champs lat/lon restent modifiables.';
+    } else {
+      aide.textContent = "L'arriv\u00e9e est le point de d\u00e9part de l'autre bateau. " +
+        'Les champs lat/lon restent modifiables.';
+    }
     zone.appendChild(aide);
   }
 
@@ -1392,28 +1460,39 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     courante.parametres.forEach(function (p) {
       var label = document.createElement('label');
       label.textContent = p.label;
-      var champ;
+      var controle;
       if (p.type === 'choix') {
-        champ = document.createElement('select');
+        controle = document.createElement('select');
         p.choix.forEach(function (c) {
           var o = document.createElement('option');
           o.value = c; o.textContent = c;
           if (c === p.defaut) o.selected = true;
-          champ.appendChild(o);
+          controle.appendChild(o);
         });
       } else {
-        champ = document.createElement('input');
-        champ.type = 'text';
-        champ.value = p.defaut;
+        controle = document.createElement('input');
+        controle.type = 'text';
+        controle.value = p.defaut;
       }
-      champ.dataset.nom = p.nom;
-      champ.addEventListener('input', function () {
-        if (/^(depart|arrivee)_(lat|lon)$/.test(p.nom)) majListePoint(p.nom.split('_')[0]);
+      controle.dataset.nom = p.nom;
+      controle.addEventListener('input', function () {
+        if (p.nom === 'retour_lat' || p.nom === 'retour_lon') {
+          var mode = champ('retour_mode');
+          if (mode) mode.value = 'point';
+        }
+        if (/^(depart|arrivee|bouee|retour)_(lat|lon)$/.test(p.nom)) {
+          majListePoint(p.nom.split('_')[0]);
+        }
+        if (p.nom.indexOf('retour_') === 0) majModePoints();
         demanderApercu();
       });
-      champ.addEventListener('change', function () { majModePoints(); demanderApercu(); });
+      controle.addEventListener('change', function () { majModePoints(); demanderApercu(); });
       zone.appendChild(label);
-      zone.appendChild(champ);
+      zone.appendChild(controle);
+      if (p.cacher) {
+        label.style.display = 'none';
+        controle.style.display = 'none';
+      }
     });
     remplirPoints();
     majModePoints();
@@ -1426,6 +1505,16 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     el('missionPoints').style.opacity = auto ? '0.4' : '';
     var ids = ['depart_lat', 'depart_lon', 'arrivee_lat', 'arrivee_lon'];
     ids.forEach(function (n) { var c = champ(n); if (c) c.style.opacity = auto ? '0.4' : ''; });
+    var retourMode = champ('retour_mode');
+    var retourDepart = !!retourMode && retourMode.value === 'depart';
+    ['retour_lat', 'retour_lon'].forEach(function (n) {
+      var c = champ(n); if (c) c.style.opacity = retourDepart ? '0.4' : '';
+    });
+    var selRetour = el('missionPoints').querySelector('select[data-point="retour"]');
+    if (selRetour) {
+      if (retourDepart) selRetour.value = '__depart__';
+      else majListePoint('retour');
+    }
   }
 
   function parametresSaisis() {
@@ -1476,7 +1565,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       var v = parametresSaisis();
       var attente = v.attente !== undefined ? v.attente : '?';
       var avertissement = '';
-      if (courante.nom === 'abba' && !(state && state.autre && state.autre.lien === 'ok')) {
+      if ((courante.nom === 'abba' || courante.nom === 'capture') && !(state && state.autre && state.autre.lien === 'ok')) {
         avertissement = '\n\nATTENTION : l\'autre bateau n\'est pas vu (lien ' +
           ((state && state.autre && LIENS[state.autre.lien]) || (state && state.autre && state.autre.lien) || '?') +
           '). La mission attendra sa position pendant 60 s.';
@@ -1569,6 +1658,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     if (autre && autre.lien === 'non_configure') etat.push("Serveur non configur\u00e9 : renseigner l'IP.");
     if (!commSaisie) el('commEtat').textContent = etat.join('\n');
     el('missionJournal').style.display = state.journal ? 'block' : 'none';
+    el('missionKml').style.display = state.kml ? 'block' : 'none';
   }
 
   function applyState(s) {
@@ -2191,9 +2281,11 @@ class MissionBoat(object):
     def get_state(self):
         p = self.session.etat()
         trail = p.get("trail") or []
+        trail_autre = p.get("trail_autre") or []
         age = p.get("fix_age")
         etat = {
             "trail": trail,
+            "trail_autre": trail_autre,
             "notice": self._texte(p),
             "mission": p.get("mission"),
             "guidage": p.get("guidage"),
@@ -2206,6 +2298,7 @@ class MissionBoat(object):
             "cap_cible": p.get("cap_cible"),
             "moteurs": p.get("moteurs"),
             "journal": p.get("journal"),
+            "kml": p.get("kml"),
             "autre": p.get("autre"),
         }
         if p.get("x") is None:
@@ -2325,6 +2418,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             'attachment; filename="{}"'.format(chemin.name))
+            self.send_header("Content-Length", str(len(corps)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(corps)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        elif route == "/kml" and self.session is not None \
+                and self.session.chemin_kml_courant() is not None:
+            chemin = self.session.chemin_kml_courant()
+            try:
+                with open(str(chemin), "rb") as fichier:
+                    corps = fichier.read()
+            except OSError as exc:
+                self._envoyer(404, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
+                return
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "application/vnd.google-earth.kml+xml; charset=utf-8")
             self.send_header("Content-Disposition",
                              'attachment; filename="{}"'.format(chemin.name))
             self.send_header("Content-Length", str(len(corps)))

@@ -11,6 +11,7 @@ Essais (a faire avant la mission polygone, dans l'ordre) :
 
 Mission :
 
+- ralliement : rejoint un point connu ou choisi sur la carte, puis s'arrete ;
 - polygone    : parcourt un polygone defini dans polygone.json, avec le
                 gradient de ligne (segment courant) et le gradient ponctuel
                 (sommet vise) ;
@@ -29,6 +30,7 @@ from pathlib import Path
 import numpy as np
 
 from ddboatclass import angle_diff
+from mission_capture_ihm import MissionCapture
 from mission_communication import MissionABBA
 from mission_d1 import MissionD1
 from navigation import SuiveurChemin, construire_chemin_ferme, point_a_distance
@@ -45,6 +47,12 @@ def _param(nom, label, defaut, **autres):
 
 class _MissionNavigation(Mission):
     """Fonctions communes : attente du GPS, compte a rebours, point de depart."""
+
+    @staticmethod
+    def _local(session, lat, lon):
+        x, y = session.convertisseur.convert_cart_position(
+            lat, lon, session.env.home_latlong, session.env.rotation)
+        return np.array([float(x), float(y)])
 
     def _preparer_depart(self, attente):
         s = self.s
@@ -304,6 +312,128 @@ class EssaiPoint(_MissionNavigation):
             if issue != "termine":
                 return 1, issue
         s.definir_phase("TERMINE", "essai termine")
+        return 0, "termine"
+
+
+# ----------------------------------------------------------------------
+# Mission : rejoindre un point (rappel du bateau)
+# ----------------------------------------------------------------------
+class MissionRalliement(_MissionNavigation):
+    NOM = "ralliement"
+    TITRE = "Mission : rejoindre un point"
+    DESCRIPTION = ("Rejoint un point choisi (point connu de points.json ou clic "
+                   "sur la carte) depuis la position actuelle. Utilise le gradient "
+                   "ponctuel, compense la derive, ralentit sur les derniers metres, "
+                   "puis coupe les moteurs dans le rayon d'arrivee. Utile pour "
+                   "rappeler le bateau au bord ou au ponton.")
+    PARAMETRES = [
+        _param("cible_lat", "Point a rejoindre : latitude (deg)", 48.198863),
+        _param("cible_lon", "Point a rejoindre : longitude (deg)", -3.015070),
+        _param("rayon_arrivee", "Rayon d'arrivee (m)", 3.0),
+        _param("ralentir_fin", "Ralentir sur les derniers (m)", 12.0),
+        _param("vitesse_fin", "Vitesse d'arrivee (commande moteur)", 70,
+               type="entier"),
+        _param("vitesse", "Vitesse (commande moteur)", 130, type="entier"),
+        _param("derive", "Compensation de derive", "oui", type="choix",
+               choix=CHOIX_OUI_NON),
+        _param("ecart_max", "Arret si ecart a la route > (m)", 60.0),
+        _param("timeout", "Duree maximale (s)", 1800.0),
+        _param("attente", "Compte a rebours (s)", 10.0),
+    ]
+
+    @classmethod
+    def apercu(cls, session, parametres):
+        cible = cls._local(session, parametres["cible_lat"],
+                           parametres["cible_lon"])
+        position = session.position_actuelle()
+        if position is None:
+            return [cible]
+        return [np.array([position[0], position[1]], dtype=float), cible]
+
+    def _verifier_parametres(self):
+        p = self.p
+        if abs(p["cible_lat"]) > 90.0:
+            return "latitude de la cible invalide"
+        if abs(p["cible_lon"]) > 180.0:
+            return "longitude de la cible invalide"
+        if p["rayon_arrivee"] <= 0.0:
+            return "rayon d'arrivee > 0"
+        if p["ralentir_fin"] < 0.0:
+            return "ralentissement >= 0"
+        if not 0 < p["vitesse_fin"] <= p["vitesse"]:
+            return "il faut 0 < vitesse d'arrivee <= vitesse"
+        if p["ecart_max"] <= 0.0 or p["timeout"] <= 0.0:
+            return "ecart maximal et duree maximale doivent etre positifs"
+        return None
+
+    def executer(self):
+        s, ddb, p = self.s, self.ddb, self.p
+        erreur = self._verifier_parametres()
+        if erreur:
+            s.definir_phase("ECHEC", erreur)
+            return 1, "parametres"
+        cible = np.array(s.convertisseur.convert_cart_position(
+            p["cible_lat"], p["cible_lon"], self.env.home_latlong,
+            self.env.rotation), dtype=float)
+        depart = self._preparer_depart(p["attente"])
+        if depart is None:
+            return 1, "pas_de_gps"
+        position, age = s.position_fraiche()
+        if position is None:
+            s.definir_phase("ECHEC", "aucun fix GPS")
+            return 1, "pas_de_gps"
+        dist_depart = float(np.linalg.norm(position - cible))
+        derive = p["derive"] == "oui"
+        s.ajouter_point_kml("Cible", p["cible_lat"], p["cible_lon"],
+                            "point a rejoindre", "retour")
+        s.ecrire_journal("ralliement", {
+            "cible": cible, "cible_latlon": (p["cible_lat"], p["cible_lon"]),
+            "x": position[0], "y": position[1], "age": age,
+            "dist_depart": dist_depart, "rayon_arrivee": p["rayon_arrivee"],
+            "vitesse": p["vitesse"], "vitesse_fin": p["vitesse_fin"],
+            "ralentir_fin": p["ralentir_fin"], "derive": derive,
+        })
+        if dist_depart <= p["rayon_arrivee"]:
+            ddb._arreter_moteurs()
+            s.ecrire_journal("arrivee", {
+                "x": position[0], "y": position[1], "dist_cible": dist_depart,
+                "deja_sur_place": True})
+            s.ecrire_journal("bilan", {
+                "issue": "termine", "dist_depart": dist_depart,
+                "dist_fin": dist_depart, "deja_sur_place": True, "segments": []})
+            s.definir_phase("TERMINE", "deja au point")
+            return 0, "termine"
+
+        a = [float(position[0]), float(position[1])]
+        b = [float(cible[0]), float(cible[1])]
+        suiveur = SuiveurChemin([a, b], rayon_arrivee=p["rayon_arrivee"],
+                                k_ligne=0.0)
+        s.definir_phase("RALLIEMENT", "vers le point a {:.0f} m".format(
+            dist_depart))
+        s.definir_guidage(chemin=[a, b], a=a, b=b,
+                          zones=[p["rayon_arrivee"]], n_segments=1,
+                          derive=derive)
+        issue, resume = s.suivre_chemin(
+            suiveur, derive=derive, vitesse=p["vitesse"],
+            ecart_max=p["ecart_max"], timeout=p["timeout"],
+            etiquette=self.NOM, ralentir_fin=p["ralentir_fin"],
+            vitesse_fin=p["vitesse_fin"])
+        position_fin, _ = s.position_fraiche()
+        dist_fin = (float(np.linalg.norm(position_fin - cible))
+                    if position_fin is not None else None)
+        if issue == "termine":
+            s.ecrire_journal("arrivee", {
+                "x": position_fin[0] if position_fin is not None else None,
+                "y": position_fin[1] if position_fin is not None else None,
+                "dist_cible": dist_fin, "deja_sur_place": False})
+        s.ecrire_journal("bilan", {
+            "issue": issue, "dist_depart": dist_depart,
+            "dist_fin": dist_fin, "segments": resume,
+            "deja_sur_place": False})
+        if issue != "termine":
+            s.definir_phase("ECHEC", "ralliement interrompu ({})".format(issue))
+            return 1, issue
+        s.definir_phase("TERMINE", "point rejoint")
         return 0, "termine"
 
 
@@ -662,8 +792,8 @@ class StationKeeping(_MissionNavigation):
         bilan["duree_veille"] += time.monotonic() - debut
 
 
-MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionPolygone, Mission3,
-            StationKeeping, MissionABBA]
+MISSIONS = [MissionD1, EssaiCap, EssaiSegment, EssaiPoint, MissionRalliement,
+            MissionPolygone, Mission3, StationKeeping, MissionABBA, MissionCapture]
 
 
 def enregistrer_missions(session):

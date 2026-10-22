@@ -10,7 +10,8 @@ lire l'etat (`etat()`) ou poser une demande (`lancer()`, `arreter()`).
 Chaque mission ecrit son propre journal logs/<mission>_AAAAMMJJ_HHMMSS.jsonl :
 une ligne JSON par evenement (configuration, phases, fix GPS, commandes de
 cap, guidage, erreurs avec trace). Il est telechargeable depuis l'IHM
-(/journal).
+(/journal). Un KML de la meme mission (trace du bateau, trace de l'autre
+bateau, points de capture et de retour) est ecrit a cote (/kml).
 """
 
 import datetime
@@ -26,6 +27,7 @@ import time
 import traceback
 from collections import deque
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import numpy as np
 
@@ -40,6 +42,7 @@ from ddboatclass import DDBoat, ArretDemande, angle_diff, dist_cart  # noqa: E40
 import communication  # noqa: E402  (client UDP du serveur du lac, fige)
 
 AGE_FIX_MAX = 3.0  # au-dela, la position GPS est consideree perimee (s)
+R_TERRE = 6371000.0  # rayon moyen, pour le passage local -> lat/lon (KML)
 
 # Communication avec l'autre bateau (voir Session._boucle_communication).
 COMM_DEFAUT = {"ip": "", "port": 6800, "mon_id": 3, "autre_id": 4}
@@ -223,8 +226,10 @@ class Session(object):
         "ARRIVEE": "Base atteinte",
         "ESSAI": "Essai en cours",
         "NAVIGATION": "Navigation",
+        "APPROCHE": "Approche de la bouee",
+        "RETOUR": "Retour au depart",
         "MAINTIEN": "Maintien de position",
-        "RALLIEMENT": "Retour dans la zone",
+        "RALLIEMENT": "Ralliement",
         "ATTENTE_AUTRE": "Attente de l'autre bateau",
         "EVITEMENT": "Evitement de l'autre bateau",
         "BUT_OCCUPE": "But occupe : attente",
@@ -252,6 +257,8 @@ class Session(object):
         self.phase = "VEILLE"
         self.message = ""
         self.trail = deque(maxlen=1500)
+        self.trail_autre = deque(maxlen=1500)
+        self._kml_points = []
         self.guidage = None
         self.ddb = None
         self.monde = None
@@ -501,6 +508,7 @@ class Session(object):
             self._config_comm = config
             if (config["ip"], config["autre_id"]) != (ancienne["ip"], ancienne["autre_id"]):
                 self._autre = None
+                self.trail_autre.clear()
             self._erreur_comm = None
             self._derniere_erreur_comm = None
         try:
@@ -577,6 +585,10 @@ class Session(object):
             self._autre = {"id": config["autre_id"], "lat": lat, "lon": lon,
                            "cap": cap % 360.0, "x": float(x), "y": float(y),
                            "age_lu": max(0.0, age), "t_lu": maintenant}
+            if (not self.trail_autre
+                    or math.hypot(float(x) - self.trail_autre[-1][0],
+                                  float(y) - self.trail_autre[-1][1]) >= 0.7):
+                self.trail_autre.append([round(float(x), 1), round(float(y), 1)])
 
     def _signaler_erreur_comm(self, etape, exc):
         texte = "{} : {}".format(etape, exc)
@@ -672,6 +684,13 @@ class Session(object):
     def chemin_journal_courant(self):
         return self.chemin_journal
 
+    def chemin_kml_courant(self):
+        """KML de la derniere mission (meme nom que le journal), ou None."""
+        if not self.chemin_journal:
+            return None
+        chemin = self.chemin_journal.with_suffix(".kml")
+        return chemin if chemin.exists() else None
+
     def _nom_journal(self):
         """Chemin du journal affiche par l'IHM (relatif au depot s'il y est)."""
         if not self.chemin_journal:
@@ -681,6 +700,112 @@ class Session(object):
         except ValueError:
             return str(self.chemin_journal)
 
+    def _nom_kml(self):
+        chemin = self.chemin_kml_courant()
+        if chemin is None:
+            return None
+        try:
+            return str(chemin.relative_to(BASE_DIR))
+        except ValueError:
+            return str(chemin)
+
+    # ------------------------------------------------------------------
+    # KML : trace de la mission, dans le meme dossier que le journal
+    # ------------------------------------------------------------------
+    def local_vers_latlon(self, x, y):
+        """Inverse de DDBoat.convert_cart_position (approximation locale)."""
+        lat0 = float(self.env.home_latlong[0])
+        lon0 = float(self.env.home_latlong[1])
+        rotation = float(self.env.rotation)
+        dx = float(x) * math.cos(rotation) - float(y) * math.sin(rotation)
+        dy = float(x) * math.sin(rotation) + float(y) * math.cos(rotation)
+        lat = lat0 + math.degrees(dy / R_TERRE)
+        lon = lon0 + math.degrees(
+            dx / (R_TERRE * math.cos(math.radians(lat0))))
+        return lat, lon
+
+    def ajouter_point_kml(self, nom, lat, lon, description="", style=""):
+        """Ajoute un point nomme au KML de la mission en cours."""
+        self._kml_points.append({
+            "nom": str(nom), "lat": float(lat), "lon": float(lon),
+            "description": str(description), "style": str(style)})
+
+    def _kml_track(self, points):
+        morceaux = []
+        for point in points:
+            lat, lon = self.local_vers_latlon(float(point[0]), float(point[1]))
+            morceaux.append("{:.7f},{:.7f},0".format(lon, lat))
+        return " ".join(morceaux)
+
+    def _ecrire_kml(self, titre, resultat, duree):
+        """Ecrit logs/<mission>_<date>.kml (trace des deux bateaux)."""
+        if self.chemin_journal is None:
+            return None
+        chemin = self.chemin_journal.with_suffix(".kml")
+        with self.verrou:
+            trace = list(self.trail)
+        with self._verrou_comm:
+            trace_autre = list(self.trail_autre)
+
+        lignes = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<kml xmlns="http://www.opengis.net/kml/2.2">',
+            '<Document>',
+            '<name>{}</name>'.format(escape(titre)),
+            '<description>{}</description>'.format(escape(
+                "Mission {} - resultat {} - duree {:.1f} s".format(
+                    self.info_mission.get("nom") or "", resultat, duree))),
+            '<Style id="trace-bateau"><LineStyle><color>ff2f55d4</color>'
+            '<width>3</width></LineStyle></Style>',
+            '<Style id="trace-autre"><LineStyle><color>ffa04f6b</color>'
+            '<width>2</width></LineStyle></Style>',
+            '<Style id="point-mission"><IconStyle><color>ff1e7abf</color>'
+            '<scale>1.1</scale></IconStyle></Style>',
+        ]
+        couleurs = {
+            "bouee": "ff1e7abf", "depart": "ff2f7d5a",
+            "retour": "ffa53d26", "capture": "ffbf7a21",
+        }
+        for nom, couleur in couleurs.items():
+            lignes.append(
+                '<Style id="point-{}"><IconStyle><color>{}</color>'
+                '<scale>1.2</scale></IconStyle></Style>'.format(nom, couleur))
+
+        if len(trace) >= 2:
+            lignes.append(
+                '<Placemark><name>Trace du bateau</name>'
+                '<styleUrl>#trace-bateau</styleUrl><LineString>'
+                '<tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>'
+                '<coordinates>{}</coordinates></LineString></Placemark>'.format(
+                    self._kml_track(trace)))
+        if len(trace_autre) >= 2:
+            lignes.append(
+                '<Placemark><name>Trace de l\'autre bateau</name>'
+                '<styleUrl>#trace-autre</styleUrl><LineString>'
+                '<tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>'
+                '<coordinates>{}</coordinates></LineString></Placemark>'.format(
+                    self._kml_track(trace_autre)))
+        for point in self._kml_points:
+            style = point["style"]
+            style_url = ("#point-" + style if style in couleurs
+                         else "#point-mission")
+            lignes.append('<Placemark><name>{}</name>'.format(
+                escape(point["nom"])))
+            if point["description"]:
+                lignes.append('<description>{}</description>'.format(
+                    escape(point["description"])))
+            lignes.append(
+                '<styleUrl>{}</styleUrl><Point><coordinates>'
+                '{:.7f},{:.7f},0</coordinates></Point></Placemark>'.format(
+                    style_url, point["lon"], point["lat"]))
+        lignes.append('</Document>')
+        lignes.append('</kml>')
+        temporaire = chemin.with_name(chemin.name + ".tmp")
+        with open(str(temporaire), "w", encoding="utf-8") as fichier:
+            fichier.write("\n".join(lignes) + "\n")
+        os.replace(str(temporaire), str(chemin))
+        return chemin
+
     def etat(self):
         """Etat courant pour l'IHM (appele depuis le thread du serveur)."""
         with self.verrou:
@@ -689,6 +814,8 @@ class Session(object):
             trail = list(self.trail)
             guidage = dict(self.guidage) if self.guidage else None
             info = dict(self.info_mission)
+        with self._verrou_comm:
+            trail_autre = list(self.trail_autre)
         ddb = self.ddb
         cap = ddb.dernier_cap if ddb is not None else None
         cap_cible = ddb.dernier_cap_cible if ddb is not None and self.en_cours else None
@@ -705,7 +832,9 @@ class Session(object):
             "heading": (math.pi / 2 - cap - self.env.rotation) if cap is not None else None,
             "moteurs": self._moteurs(),
             "trail": trail,
+            "trail_autre": trail_autre,
             "journal": self._nom_journal(),
+            "kml": self._nom_kml(),
             "mission": info,
             "guidage": guidage,
             "derive": None,
@@ -1025,10 +1154,13 @@ class Session(object):
         with self.verrou:
             self.en_cours = True
             self.trail.clear()
+            self._kml_points = []
             self.info_mission = {"nom": nom, "titre": classe.TITRE,
                                  "etat": "en_cours", "resultat": None,
                                  "parametres": parametres,
                                  "debut": time.time(), "duree": None}
+        with self._verrou_comm:
+            self.trail_autre.clear()
         ddb.arret.clear()
         ddb.journal = None
         self.journal = Journal(self.dossier_logs, prefixe=nom)
@@ -1069,6 +1201,13 @@ class Session(object):
                 pass
             position = self._position_locale()
             duree = time.monotonic() - debut
+            try:
+                chemin_kml = self._ecrire_kml(classe.TITRE, resultat, duree)
+                if chemin_kml is not None:
+                    self.ecrire_journal("kml", {"chemin": str(chemin_kml)})
+                    print("KML : {}".format(chemin_kml))
+            except Exception as exc:
+                print("KML non ecrit : {}".format(exc))
             self.ecrire_journal("fin", {
                 "resultat": resultat, "duree": duree,
                 "x": position[0] if position is not None else None,
