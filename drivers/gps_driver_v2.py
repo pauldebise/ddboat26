@@ -85,13 +85,15 @@ class GpsIO:
         #print (bmsg)
         self.ser.write(bmsg)
 
-    def get_mtk_status (self):
+    def get_mtk_status (self, timeout=None):
+        fin = None if timeout is None else time.monotonic() + float(timeout)
         while True:
             rcv = self.read_next_message()
             if rcv.startswith("$PMTK"):
                 #print (rcv)
-                break
-        return rcv
+                return rcv
+            if fin is not None and time.monotonic() >= fin:
+                return None
         
     def get_filter_speed(self):
         pmtk = "PMTK447"
@@ -172,10 +174,10 @@ class GpsIO:
         rcv = self.get_mtk_status ()
         return rcv
 
-    def set_nmea_update_rate (self,rate):
+    def set_nmea_update_rate (self,rate,timeout=None):
         pmtk = "PMTK220,%d"%(rate)
         self.send_mtk_cmd (pmtk)
-        rcv = self.get_mtk_status ()
+        rcv = self.get_mtk_status (timeout=timeout)
         return rcv
     
     def get_version(self):

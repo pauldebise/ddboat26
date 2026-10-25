@@ -46,8 +46,10 @@ R_TERRE = 6371000.0  # rayon moyen, pour le passage local -> lat/lon (KML)
 
 # Communication avec l'autre bateau (voir Session._boucle_communication).
 COMM_DEFAUT = {"ip": "", "port": 6800, "mon_id": 3, "autre_id": 4}
-PERIODE_ENVOI = 1.0     # envoi de notre position (s)
-PERIODE_LECTURE = 0.2   # relecture de l'etat des bateaux (s)
+PERIODE_ENVOI = 1.0          # envoi de notre position en veille (s)
+PERIODE_ENVOI_CAPTURE = 0.5  # envoi pendant la mission capture (2 Hz)
+PERIODE_LECTURE = 0.2        # relecture de l'etat des bateaux (s)
+CADENCE_GPS_MS = 500         # periode NMEA demandee au GPS (500 ms = 2 Hz)
 AGE_LIEN_MAX = 3.0      # au-dela, le lien avec l'autre bateau est affiche perdu (s)
 DIST_AUTRE_MAX = 200.0  # une position a plus de ... m de la base est rejetee
 
@@ -277,6 +279,9 @@ class Session(object):
                              else BASE_DIR / "communication.json")
         self._verrou_comm = threading.Lock()
         self._config_comm = self._lire_config_communication()
+        self.periode_envoi = PERIODE_ENVOI
+        self.cadence_gps_ms = None
+        self.cadence_gps_confirmee = None
         self._autre = None
         self._erreur_comm = None
         self._derniere_erreur_comm = None
@@ -344,18 +349,42 @@ class Session(object):
     # ------------------------------------------------------------------
     # Materiel
     # ------------------------------------------------------------------
+    def _configurer_cadence_gps(self, gps):
+        """Demande 2 Hz au GPS (PMTK220, duree en ms) sans bloquer au demarrage."""
+        self.cadence_gps_ms = CADENCE_GPS_MS
+        self.cadence_gps_confirmee = False
+        try:
+            reponse = gps.set_nmea_update_rate(CADENCE_GPS_MS, timeout=2.0)
+        except Exception as exc:
+            print("Cadence GPS 2 Hz non appliquee : {}".format(exc))
+            return
+        if reponse is None:
+            print("Cadence GPS 2 Hz non confirmee (pas de reponse PMTK)")
+            return
+        self.cadence_gps_confirmee = "PMTK001,220,3" in reponse
+        if self.cadence_gps_confirmee:
+            print("Cadence GPS : 2 Hz")
+        else:
+            print("Cadence GPS 2 Hz refusee : {}".format(reponse.strip()))
+
     def ouvrir_materiel(self):
         if self.simulation is not None:
             import simulation
             parametres = dict(self.simulation)
+            periode_gps = float(parametres.pop(
+                "periode_gps", CADENCE_GPS_MS / 1000.0))
             ard, gps, imu, self.monde = simulation.creer_materiel(
-                self.env.home_latlong, self.env.rotation, **parametres)
+                self.env.home_latlong, self.env.rotation,
+                periode_gps=periode_gps, **parametres)
+            self.cadence_gps_ms = int(round(periode_gps * 1000.0))
+            self.cadence_gps_confirmee = True
         else:
             from arduino_driver_v2 import ArduinoIO
             from gps_driver_v2 import GpsIO
             from imu9_driver_v2 import Imu9IO
             ard = ArduinoIO()
             gps = GpsIO(tty_dev=self.gps_index)
+            self._configurer_cadence_gps(gps)
             imu = Imu9IO()
         self._gps = gps
         ddb = DDBoat(ard, gps, imu)
@@ -521,18 +550,20 @@ class Session(object):
         return config
 
     def _boucle_communication(self):
-        """Envoie notre position (1 Hz) et relit celle de l'autre bateau.
+        """Envoie notre position et relit celle de l'autre bateau.
 
-        Elle ne bloque jamais une mission : toute erreur est notee et la
-        boucle continue. Le client communication.py est utilise tel quel.
+        La periode vaut 1 s en veille et 0,5 s pendant la mission capture
+        (2 Hz). Elle ne bloque jamais une mission : toute erreur est notee et
+        la boucle continue. Le client communication.py est utilise tel quel.
         """
         dernier_envoi = None
         while not self._stop_materiel:
             with self._verrou_comm:
                 config = dict(self._config_comm)
+                periode_envoi = self.periode_envoi
             if config["ip"]:
                 maintenant = time.monotonic()
-                if dernier_envoi is None or maintenant - dernier_envoi >= PERIODE_ENVOI:
+                if dernier_envoi is None or maintenant - dernier_envoi >= periode_envoi:
                     dernier_envoi = maintenant
                     try:
                         self._envoyer_position(config)
@@ -542,7 +573,9 @@ class Session(object):
                     self._lire_autre(config, maintenant)
                 except Exception as exc:
                     self._signaler_erreur_comm("lecture", exc)
-            time.sleep(PERIODE_LECTURE)
+            # A 2 Hz, veiller plus souvent que la periode d'envoi pour ne pas
+            # la depasser de 0,2 s (2 Hz tomberait sinon a 1,7 Hz).
+            time.sleep(min(PERIODE_LECTURE, max(0.05, periode_envoi / 4.0)))
 
     def _envoyer_position(self, config):
         ddb = self.ddb
@@ -1119,6 +1152,9 @@ class Session(object):
             "python": sys.version.split()[0],
             "machine": platform.node(),
             "simulation": self.simulation is not None,
+            "periode_envoi": self.periode_envoi,
+            "cadence_gps_ms": self.cadence_gps_ms,
+            "cadence_gps_confirmee": self.cadence_gps_confirmee,
             "home_latlong": env.home_latlong,
             "rotation": env.rotation,
             "couloir": env.couloir,
@@ -1161,6 +1197,8 @@ class Session(object):
                                  "debut": time.time(), "duree": None}
         with self._verrou_comm:
             self.trail_autre.clear()
+            self.periode_envoi = (PERIODE_ENVOI_CAPTURE
+                                  if classe.NOM == "capture" else PERIODE_ENVOI)
         ddb.arret.clear()
         ddb.journal = None
         self.journal = Journal(self.dossier_logs, prefixe=nom)
@@ -1195,6 +1233,8 @@ class Session(object):
             else:
                 traceback.print_exc()
         finally:
+            with self._verrou_comm:
+                self.periode_envoi = PERIODE_ENVOI
             try:
                 ddb._arreter_moteurs()
             except Exception:

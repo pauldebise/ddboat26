@@ -13,10 +13,12 @@ Session, appelle les fonctions de mission_capture.py, envoie les commandes
 et journalise. La loi (normale, erreur, u_envitesse, repulsion, capture)
 reste dans mission_capture.py.
 
-Communication : le thread de Session echange les positions et les caps a
-1 Hz. Le cap recu est en degres ; la loi de guidage travaille en radians.
-Ici, on ne se sert pas du cap recu pour le guidage : les positions
-suffisent. Le cap est seulement journalise.
+Communication : pendant la mission capture, le thread de Session echange les
+positions et les caps a 2 Hz (0,5 s). Le GPS est configure a 2 Hz au demarrage
+de la session (PMTK220, 500 ms) quand le recepteur le confirme. Le cap recu
+est en degres ; la loi de guidage travaille en radians. Ici, on ne se sert pas
+du cap recu pour le guidage : les positions suffisent. Le cap est seulement
+journalise.
 
 Les deux bateaux doivent lancer la meme mission avec le meme point de
 capture et des ids differents (14 et 18). La position de depart du milieu
@@ -85,9 +87,9 @@ class MissionCapture(Mission):
 
     ATTENTE_AUTRE_MAX = 60.0
     REPRISE_URGENCE = 3.0       # reprise apres l'arret d'urgence (m)
-    # La position de l'autre et la notre arrivent a 1 Hz : a 1,5 m/s,
-    # l'ecart estime peut etre faux de 1 a 3 m. On garde donc une marge
-    # large avant de conclure que la corde est trop tendue.
+    # La position de l'autre et la notre arrivent a 2 Hz pendant la capture :
+    # a 1,5 m/s, le deplacement entre deux paquets est d'environ 0,75 m.
+    # On garde une marge large avant de conclure que la corde est trop tendue.
     MARGE_CORDE = 4.0           # arret si d_autre > L + MARGE_CORDE
     MARGE_CORDE_REPRISE = 2.0   # reprise si d_autre <= L + MARGE_CORDE_REPRISE
 

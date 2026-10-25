@@ -15,8 +15,8 @@ Modele physique (regle sur le journal de la mission du 20/10) :
 - moteurs de poussee legerement differente ;
 - derive constante (vent, courant) et couple de vent sur le cap ;
 - compas avec biais et bruit (1,2 deg) ;
-- GPS a 1 Hz, bruit correle de quelques dizaines de centimetres, trames NMEA
-  GLL et GGA avec checksum.
+- GPS a 1 Hz par defaut, cadence reglable (2 Hz en session), bruit correle de
+  quelques dizaines de centimetres, trames NMEA GLL et GGA avec checksum.
 
 Le bateau reste amarre (immobile) jusqu'a la premiere commande moteur, comme
 quand on le tient a la main pendant le compte a rebours.
@@ -204,21 +204,26 @@ def _ddmm(valeur, largeur):
 
 
 class SerieSimulee(object):
-    """Flux NMEA GLL + GGA a 1 Hz, comme le GPS du bateau."""
+    """Flux NMEA GLL + GGA a la cadence demandee (1 Hz par defaut)."""
 
-    def __init__(self, monde):
+    def __init__(self, monde, periode=1.0):
         self.monde = monde
+        self.periode = float(periode)
+        if self.periode <= 0.0:
+            raise ValueError("periode GPS > 0")
         self.tampon = b""
-        self.prochaine = math.ceil(time.monotonic())
+        self.prochaine = (math.ceil(time.monotonic() / self.periode)
+                          * self.periode)
 
     def _alimenter(self):
         maintenant = time.monotonic()
         while self.prochaine <= maintenant:
             self.monde.avancer(self.prochaine)
             lat, lon = self.monde.latlon_mesure()
-            reste = int(15 * 3600 + 41 * 60 + 5 + self.prochaine)
-            heure = "{:02d}{:02d}{:02d}.000".format(
-                (reste // 3600) % 24, (reste // 60) % 60, reste % 60)
+            reste = 15 * 3600 + 41 * 60 + 5 + self.prochaine
+            heure = "{:02d}{:02d}{:06.3f}".format(
+                int(reste // 3600) % 24, int(reste // 60) % 60,
+                reste % 60)
             champs_pos = "{},{},{},{}".format(
                 _ddmm(lat, 2), "N" if lat >= 0 else "S",
                 _ddmm(lon, 3), "E" if lon >= 0 else "W")
@@ -227,7 +232,7 @@ class SerieSimulee(object):
             for corps in (gga, gll):
                 ligne = "${}*{}\r\n".format(corps, _checksum(corps))
                 self.tampon += ligne.encode("ascii")
-            self.prochaine += 1
+            self.prochaine += self.periode
 
     @property
     def in_waiting(self):
@@ -244,8 +249,8 @@ class SerieSimulee(object):
 
 
 class GpsSimule(object):
-    def __init__(self, monde):
-        self.ser = SerieSimulee(monde)
+    def __init__(self, monde, periode=1.0):
+        self.ser = SerieSimulee(monde, periode=periode)
 
     def close(self):
         pass
@@ -288,8 +293,10 @@ class ArduinoSimule(object):
         self.monde.commander(gauche, droite)
 
 
-def creer_materiel(origine, rotation=0.0, acceleration=1.0, **parametres):
+def creer_materiel(origine, rotation=0.0, acceleration=1.0,
+                   periode_gps=1.0, **parametres):
     """Retourne (arduino, gps, imu, monde) simules."""
     installer_horloge(acceleration)
     monde = MondeSimule(origine, rotation, **parametres)
-    return ArduinoSimule(monde), GpsSimule(monde), ImuSimule(monde), monde
+    return (ArduinoSimule(monde), GpsSimule(monde, periode=periode_gps),
+            ImuSimule(monde), monde)

@@ -75,12 +75,17 @@ matériel (voir l'en-tête du script pour les scénarios).
 Deux ddboats sont reliés par une corde. La mission fait l'aller-retour du
 milieu de la corde : le milieu va capturer le point choisi, puis revient à
 son point de départ, à un point connu de `points.json`, ou à un point cliqué
-sur la carte. Les deux bateaux lancent la même mission avec le même point de
-capture et des ids différents (14 et 18) ; le panneau **Communication** doit
-être configuré sur les deux. Dans le panneau **Missions**, la ligne **Bouée**
-choisit le point à capturer parmi les points connus (ou **Clic carte**) ; la
-ligne **Retour** propose **Départ de la mission (milieu)**, les points connus
-et **Clic carte**. En ligne de commande, les mêmes choix passent par
+sur la carte. Pendant la mission, les positions sont échangées à **2 Hz**
+(0,5 s) au lieu de 1 Hz en veille. Au démarrage de la session, le GPS est
+aussi configuré à **2 Hz** (`PMTK220,500`) si le récepteur le confirme ; le
+journal `configuration` indique `cadence_gps_ms` et `cadence_gps_confirmee`,
+et les événements `fix` permettent de vérifier la cadence réelle. Les deux
+bateaux lancent la même mission avec le même point de capture et des ids
+différents (14 et 18) ; le panneau **Communication** doit être configuré sur
+les deux. Dans le panneau **Missions**, la ligne **Bouée** choisit le point à
+capturer parmi les points connus (ou **Clic carte**) ; la ligne **Retour**
+propose **Départ de la mission (milieu)**, les points connus et **Clic
+carte**. En ligne de commande, les mêmes choix passent par
 `--param retour_mode=depart|point --param retour_lat=... --param retour_lon=...`.
 Les trajectoires du bateau et de l'autre bateau sont tracées sur la carte (la
 trace de l'autre est en violet).
@@ -93,12 +98,13 @@ ralentit. Les bateaux ne reculent jamais : le côté intérieur peut s'arrêter,
 ce qui donne un rayon de courbure minimal de `L/2`. La répulsion de l'autre
 bateau s'ajoute à la direction (rayon 6 m, gain 0,4 par défaut), et les sécurités
 coupent les moteurs si l'autre est trop proche (< 4 m), si sa position a plus
-de 3 s, ou si la corde est trop tendue (> L + 4 m ; marge large car les
-positions arrivent à 1 Hz). La capture est détectée quand le segment de corde
-passe à moins de `rayon_capture` du point à capturer ; le retour est terminé
-quand le milieu revient à moins de `rayon_arrivee` du point de retour (6 m par
-défaut : avec L = 10 m et sans marche arrière, le rayon de courbure minimal
-est 5 m, donc un rayon d'arrivée de 3 m ferait orbiter la formation).
+de 3 s, ou si la corde est trop tendue (> L + 4 m ; marge large malgré les
+positions à 2 Hz pendant la capture). La capture est détectée quand le
+segment de corde passe à moins de `rayon_capture` du point à capturer ; le
+retour est terminé quand le milieu revient à moins de `rayon_arrivee` du
+point de retour (6 m par défaut : avec L = 10 m et sans marche arrière, le
+rayon de courbure minimal est 5 m, donc un rayon d'arrivée de 3 m ferait
+orbiter la formation).
 
 Journaux : `depart`, `nav` (toutes les 0,1 s), `capture`, `capture_manquee`,
 `arrivee`, `lien_perdu`, `arret_urgence`, `corde_tendue`, `bilan`, `kml`.
