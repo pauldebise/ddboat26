@@ -124,6 +124,36 @@ est écrit à côté (`logs/<mission>_<date>.kml`) et téléchargeable sur
 `http://<IP_BATEAU>:8000/kml` ; pour tout récupérer :
 `scp ue32@<IP_BATEAU>:~/guerledan_s3/logs/*.jsonl ue32@<IP_BATEAU>:~/guerledan_s3/logs/*.kml .`.
 
+### Analyse hors ligne des journaux
+
+Sur le PC, sans bateau :
+
+```bash
+python3 ihm_lac.py
+```
+
+L'IHM ouvre le panneau **Journaux** et liste les fichiers JSONL trouvés dans
+`logs/` et `logs/simulation/` : les essais réels d'abord, puis les
+simulations, du plus récent au plus ancien. La sélection d'un journal
+affiche :
+
+- les traces du bateau et de l'autre bateau ;
+- les points de la mission : départ, arrivée, cible, bouée, retour, capture,
+  ainsi que les cercles de capture, d'arrivée et de station keeping ;
+- le chemin prévu, le polygone ou le segment éventuel ;
+- un curseur pour parcourir le journal et lire la position, le cap, la vitesse
+  et la distance à l'autre bateau à un instant donné ;
+- les paramètres, le bilan et les événements remarquables ;
+- les liens de téléchargement du JSONL et du KML. Le KML est servi depuis le
+  fichier voisin s'il existe, sinon il est généré à la demande depuis le
+  journal.
+
+Le mode est choisi automatiquement quand aucun journal n'est demandé et que
+des fichiers existent. `--replay` le force même si le dossier est vide,
+`--logs DOSSIER` analyse un autre dossier (par exemple des journaux
+téléchargés), et `--demo` force l'ancienne simulation. Sur le bateau,
+`--bateau` et `--live` ne changent pas.
+
 Sans bateau, `python3 ihm_lac.py --bateau --simulation --acceleration 5`
 lance le même programme sur un bateau simulé (vent, moteurs inégaux, compas
 biaisé), avec ses journaux dans `logs/simulation/`.

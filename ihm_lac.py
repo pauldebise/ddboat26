@@ -14,6 +14,15 @@ L'interface s'ouvre dans un navigateur (locale ou distante) et affiche :
 Usages
 ------
     python3 ihm_lac.py
+        Analyse hors ligne sur le PC : l'IHM liste les journaux de logs/,
+        affiche leur trace, celle de l'autre bateau, les points de mission,
+        les parametres, le bilan et les evenements. Un curseur permet de
+        parcourir le journal. Aucun materiel n'est ouvert.
+
+    python3 ihm_lac.py --replay --logs /chemin/vers/logs
+        Meme analyse avec un dossier de journaux telecharge ailleurs.
+
+    python3 ihm_lac.py --demo
         Simulation : un bateau parcourt le gradient depuis le couloir
         jusqu'a la base, puis recommence.
 
@@ -42,6 +51,9 @@ Journaux
 Chaque mission ecrit logs/<mission>_AAAAMMJJ_HHMMSS.jsonl (logs/simulation/
 en simulation), telechargeable sur http://<IP_BATEAU>:8000/journal, et un
 KML de la trace a cote, telechargeable sur http://<IP_BATEAU>:8000/kml.
+En analyse hors ligne, les journaux sont lus sans modification ; le KML est
+servi depuis le fichier voisin s'il existe, sinon il est genere a la demande
+depuis la trace du journal.
 
 Commandes
 ---------
@@ -65,10 +77,12 @@ import time
 import types
 import webbrowser
 from collections import deque
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 BASE_DIR = Path(__file__).resolve().parent
 DRIVERS_DIR = BASE_DIR / "drivers"
@@ -324,6 +338,60 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   }
   .mission-statut:empty { display: none; }
   .mission-journal { display: none; margin-top: 7px; font-size: 9.5px; color: var(--blue); }
+  .pill.replay .pill-dot { background: var(--blue); }
+  .pill.replay { color: var(--blue); border-color: rgba(53,102,155,.3); }
+  .replay { width: 318px; }
+  .replay-tools { display: flex; gap: 6px; align-items: stretch; }
+  .replay-tools select { flex: 1 1 auto; min-width: 0; }
+  .replay-tools button {
+    width: 30px; padding: 0; border-radius: 7px; border: 1px solid var(--line);
+    background: rgba(255,255,255,.8); color: var(--ink); cursor: pointer;
+    font-family: var(--sans); font-size: 14px; line-height: 1;
+  }
+  .replay-tools button:hover { background: #fff; }
+  .replay-resume {
+    display: grid; grid-template-columns: 72px 1fr; gap: 3px 8px;
+    margin-top: 9px; font-size: 9.4px; line-height: 1.35;
+  }
+  .replay-resume span { color: var(--muted); }
+  .replay-resume b {
+    font-family: var(--mono); font-size: 9.3px; font-weight: 500;
+    text-align: right; min-width: 0; overflow-wrap: anywhere;
+  }
+  .replay-timeline { margin-top: 9px; }
+  .replay-timeline input[type=range] { width: 100%; accent-color: var(--blue); }
+  .replay-temps {
+    display: flex; justify-content: space-between; gap: 5px;
+    font-family: var(--mono); font-size: 8.7px; color: var(--muted);
+  }
+  .replay-details {
+    margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line);
+  }
+  .replay-details summary {
+    cursor: pointer; font-size: 9px; font-weight: 600; letter-spacing: .08em;
+    text-transform: uppercase; user-select: none;
+  }
+  .replay-liste {
+    display: grid; grid-template-columns: 1fr auto; gap: 3px 8px;
+    margin-top: 5px; max-height: 160px; overflow-y: auto;
+    font-size: 9.2px; line-height: 1.3;
+  }
+  .replay-liste span { color: var(--muted); }
+  .replay-liste b {
+    font-family: var(--mono); font-size: 9px; font-weight: 500;
+    text-align: right; overflow-wrap: anywhere;
+  }
+  .replay-events {
+    margin-top: 5px; max-height: 180px; overflow-y: auto;
+    font-family: var(--mono); font-size: 8.7px; line-height: 1.45;
+  }
+  .replay-event { padding: 2px 0; border-bottom: 1px dotted var(--line); }
+  .replay-event:last-child { border-bottom: 0; }
+  .replay-event .rt { color: var(--blue); }
+  .replay-event .rl { font-weight: 600; }
+  .replay-liens { display: flex; gap: 11px; flex-wrap: wrap; margin-top: 8px; }
+  .replay-liens a { font-size: 9.5px; color: var(--blue); }
+  .replay-vide { margin-top: 9px; font-size: 9.5px; line-height: 1.4; color: var(--muted); }
   .points-box { display: none; grid-template-columns: 50px 1fr auto; gap: 5px 6px; align-items: center; margin-top: 7px; }
   .points-box label { font-size: 9.5px; color: #3c504f; }
   .points-box button {
@@ -373,6 +441,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     .control-card { gap: 7px; padding: 5px 7px; }
     .hint { display: none; }
     .mission { width: 218px; right: 10px; top: 10px; }
+    .replay { width: 238px; }
   }
 </style>
 </head>
@@ -408,8 +477,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     <div class="rows">
       <div><span>X</span><b id="posX">&mdash;</b></div>
       <div><span>Y</span><b id="posY">&mdash;</b></div>
-      <div><span>Gradient</span><b id="grad">&mdash;</b></div>
-      <div><span>MAJ</span><b id="age">&mdash;</b></div>
+      <div><span id="lblGrad">Gradient</span><b id="grad">&mdash;</b></div>
+      <div><span id="lblAge">MAJ</span><b id="age">&mdash;</b></div>
       <div><span>Autre</span><b id="autreLien">&mdash;</b></div>
       <div><span>Distance</span><b id="autreDist">&mdash;</b></div>
     </div>
@@ -468,6 +537,40 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     </details>
   </div>
 
+  <div class="card mission replay" id="replayCard">
+    <div class="mission-head">Journaux <span id="replayEtat" class="mission-etat">hors ligne</span></div>
+    <div class="replay-tools">
+      <select id="replaySel" title="Choisir un journal"></select>
+      <button id="replayRefresh" type="button" title="Relire le dossier des journaux" aria-label="Relire les journaux">&#8635;</button>
+    </div>
+    <div id="replayVide" class="replay-vide" style="display:none;">Aucun journal JSONL trouv&eacute; dans le dossier analys&eacute;.</div>
+    <div id="replayResume" class="replay-resume"></div>
+    <div id="replayTimeline" class="replay-timeline" style="display:none;">
+      <input type="range" id="replayTime" min="0" max="0" step="1" value="0" aria-label="Position dans le journal">
+      <div class="replay-temps"><span id="replayTempsDebut">&mdash;</span><span id="replayTemps">&mdash;</span><span id="replayTempsFin">&mdash;</span></div>
+    </div>
+    <details class="replay-details" open>
+      <summary>Param&egrave;tres</summary>
+      <div id="replayParams" class="replay-liste"></div>
+    </details>
+    <details class="replay-details">
+      <summary>Configuration</summary>
+      <div id="replayConfig" class="replay-liste"></div>
+    </details>
+    <details class="replay-details">
+      <summary>Bilan</summary>
+      <div id="replayBilan" class="replay-liste"></div>
+    </details>
+    <details class="replay-details">
+      <summary>&Eacute;v&eacute;nements</summary>
+      <div id="replayEvents" class="replay-events"></div>
+    </details>
+    <div class="replay-liens" id="replayLiens" style="display:none;">
+      <a id="replayJournal" href="#" target="_blank">Journal JSONL</a>
+      <a id="replayKml" href="#" target="_blank">KML</a>
+    </div>
+  </div>
+
   <div class="hint">Molette pour zoomer &middot; glisser pour déplacer</div>
 </main>
 
@@ -496,6 +599,13 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   var showTrail = true;
   var lastStateAt = 0;
   var namedPoints = [];
+  var journalListe = [];
+  var replay = null;
+  var replayMeta = null;
+  var replaySamples = [];
+  var replayAutres = [];
+  var replayIndex = 0;
+  var replayDemande = 0;
   var pickMode = null;
   var downAt = null;
   var dragging = null;
@@ -593,6 +703,31 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     view.scale = clamp(s, 0.02, 30);
     view.cx = (b.xmin + b.xmax) / 2;
     view.cy = (b.ymin + b.ymax) / 2;
+    dirty = true;
+  }
+
+  function fitReplayBounds() {
+    var b = replay && replay.bounds;
+    if (!b) return;
+    var dx = Math.max(18, b.xmax - b.xmin);
+    var dy = Math.max(18, b.ymax - b.ymin);
+    b = {
+      xmin: b.xmin - dx * 0.07, xmax: b.xmax + dx * 0.07,
+      ymin: b.ymin - dy * 0.07, ymax: b.ymax + dy * 0.07
+    };
+    dx = b.xmax - b.xmin;
+    dy = b.ymax - b.ymin;
+    var narrow = W < 700;
+    var padLeft = narrow ? 34 : Math.min(150, W * 0.13);
+    var padRight = narrow ? 34 : Math.min(350, W * 0.27);
+    var padTop = narrow ? Math.min(190, H * 0.25) : Math.min(90, H * 0.12);
+    var padBottom = narrow ? Math.min(190, H * 0.25) : Math.min(100, H * 0.14);
+    var dispoW = Math.max(60, W - padLeft - padRight);
+    var dispoH = Math.max(60, H - padTop - padBottom);
+    var s = Math.min(dispoW / dx, dispoH / dy);
+    view.scale = clamp(s, 0.02, 30);
+    view.cx = b.xmin + (W / 2 - padLeft) / view.scale;
+    view.cy = b.ymax - (H / 2 - padTop) / view.scale;
     dirty = true;
   }
 
@@ -946,7 +1081,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function drawTrail(c) {
-    if (!showTrail || view.scale < 0.5 || !state || !state.trail || state.trail.length < 2) return;
+    var seuil = DATA.replay ? 0.03 : 0.5;
+    if (!showTrail || view.scale < seuil || !state || !state.trail || state.trail.length < 2) return;
     var t = state.trail;
     c.save();
     c.beginPath();
@@ -954,8 +1090,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       var X = sx(t[i][0]), Y = sy(t[i][1]);
       if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
     }
-    c.strokeStyle = 'rgba(212,85,47,0.24)';
-    c.lineWidth = 1.5;
+    c.strokeStyle = DATA.replay ? 'rgba(212,85,47,0.58)'
+                                : 'rgba(212,85,47,0.24)';
+    c.lineWidth = DATA.replay ? 2.0 : 1.5;
     c.lineJoin = 'round';
     c.lineCap = 'round';
     c.stroke();
@@ -963,7 +1100,8 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function drawTrailAutre(c) {
-    if (!showTrail || view.scale < 0.5 || !state || !state.trail_autre || state.trail_autre.length < 2) return;
+    var seuil = DATA.replay ? 0.03 : 0.5;
+    if (!showTrail || view.scale < seuil || !state || !state.trail_autre || state.trail_autre.length < 2) return;
     var t = state.trail_autre;
     c.save();
     c.beginPath();
@@ -971,8 +1109,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       var X = sx(t[i][0]), Y = sy(t[i][1]);
       if (i === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
     }
-    c.strokeStyle = 'rgba(107,79,160,0.32)';
-    c.lineWidth = 1.6;
+    c.strokeStyle = DATA.replay ? 'rgba(107,79,160,0.62)'
+                                : 'rgba(107,79,160,0.32)';
+    c.lineWidth = DATA.replay ? 2.0 : 1.6;
     c.lineJoin = 'round';
     c.lineCap = 'round';
     c.stroke();
@@ -1038,6 +1177,91 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       c.stroke();
       c.restore();
     }
+  }
+
+  function drawReplayGeometry(c) {
+    if (!replay) return;
+    var detail = view.scale >= 0.16;
+    var paths = replay.paths || [];
+    var cercles = replay.cercles || [];
+    var points = replay.points || [];
+    var events = replay.events || [];
+    var couleurs = {
+      bouee: COL.base, retour: COL.green, cible: COL.blue,
+      depart: COL.amber, arrivee: COL.other, centre: COL.ink,
+      capture: '#b3392a', fin: COL.ink, formation: COL.muted
+    };
+
+    c.save();
+    for (var i = 0; i < paths.length; i++) {
+      var chemin = paths[i].points || [];
+      if (chemin.length < 2) continue;
+      c.beginPath();
+      for (var j = 0; j < chemin.length; j++) {
+        var X = sx(chemin[j][0]), Y = sy(chemin[j][1]);
+        if (j === 0) c.moveTo(X, Y); else c.lineTo(X, Y);
+      }
+      if (paths[i].ferme) c.closePath();
+      c.setLineDash([7, 5]);
+      c.strokeStyle = 'rgba(191,122,33,0.72)';
+      c.lineWidth = 1.5;
+      c.stroke();
+      c.setLineDash([]);
+    }
+
+    for (var k = 0; k < cercles.length; k++) {
+      var cercle = cercles[k];
+      var col = couleurs[cercle.role] || COL.amber;
+      c.beginPath();
+      c.arc(sx(cercle.x), sy(cercle.y),
+            Math.abs(sx(cercle.x + cercle.rayon) - sx(cercle.x)),
+            0, Math.PI * 2);
+      c.setLineDash(cercle.role === 'zone' ? [4, 4] : [6, 5]);
+      c.strokeStyle = col;
+      c.globalAlpha = 0.55;
+      c.lineWidth = 1.2;
+      c.stroke();
+      c.globalAlpha = 1;
+      c.setLineDash([]);
+    }
+
+    for (var p = 0; p < points.length; p++) {
+      var point = points[p];
+      var px = sx(point.x), py = sy(point.y);
+      var couleur = couleurs[point.role] || COL.ink;
+      c.beginPath();
+      c.moveTo(px, py - 4.8);
+      c.lineTo(px + 4.8, py);
+      c.lineTo(px, py + 4.8);
+      c.lineTo(px - 4.8, py);
+      c.closePath();
+      c.fillStyle = '#fbf9f2';
+      c.strokeStyle = couleur;
+      c.lineWidth = 1.7;
+      c.fill();
+      c.stroke();
+      if (detail) label(c, point.nom, px, py, 8, -7, 'left', couleur);
+    }
+
+    var marqueurs = {
+      capture_manquee: 'Capture manqu\u00e9e',
+      arret_urgence: 'Arr\u00eat urgence'
+    };
+    for (var e = 0; e < events.length; e++) {
+      var evenement = events[e];
+      if (!marqueurs[evenement.type]) continue;
+      if (evenement.x === null || evenement.x === undefined) continue;
+      var ex = sx(evenement.x), ey = sy(evenement.y);
+      c.beginPath();
+      c.arc(ex, ey, 9, 0, Math.PI * 2);
+      c.strokeStyle = '#b3392a';
+      c.lineWidth = 1.7;
+      c.setLineDash([3, 3]);
+      c.stroke();
+      c.setLineDash([]);
+      if (detail) label(c, evenement.label, ex, ey, 10, 14, 'left', '#b3392a');
+    }
+    c.restore();
   }
 
   function drawGradientArrow(c, x, y, ux, uy) {
@@ -1123,7 +1347,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   }
 
   function drawNamedPoints(c) {
-    if (!DATA.pilotage || !namedPoints.length || view.scale < 0.25) return;
+    if ((!DATA.pilotage && !DATA.replay) || !namedPoints.length || view.scale < 0.25) return;
     c.save();
     for (var i = 0; i < namedPoints.length; i++) {
       var p = namedPoints[i];
@@ -1192,6 +1416,7 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     drawTrail(ctx);
     drawNamedPoints(ctx);
     drawMission(ctx);
+    drawReplayGeometry(ctx);
     drawBoat(ctx);
     drawAutre(ctx);
     requestAnimationFrame(render);
@@ -1229,8 +1454,12 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     if (!state) return;
     var pill = document.getElementById('statusPill');
     var text = document.getElementById('statusText');
-    var stale = !!state.stale;
-    if (stale) {
+    var estReplay = state.mode === 'replay';
+    var stale = !!state.stale && !estReplay;
+    if (estReplay) {
+      pill.className = 'pill replay';
+      text.textContent = 'HORS LIGNE';
+    } else if (stale) {
       pill.className = 'pill stale';
       text.textContent = 'GPS EN ATTENTE';
     } else if (state.mode === 'live') {
@@ -1240,20 +1469,26 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
       pill.className = 'pill';
       text.textContent = 'SIMULATION';
     }
+    document.getElementById('lblGrad').textContent = estReplay ? 'Cap' : 'Gradient';
+    document.getElementById('lblAge').textContent = estReplay ? 'Temps' : 'MAJ';
 
     var boat = state.boat;
     if (boat) {
       document.getElementById('dist').textContent = fmt(boat.distance, 1);
       document.getElementById('posX').textContent = fmt(boat.x, 1) + ' m';
       document.getElementById('posY').textContent = fmt(boat.y, 1) + ' m';
-      document.getElementById('grad').textContent = bearingText(boat.field && boat.field.bearing);
+      document.getElementById('grad').textContent = estReplay
+        ? bearingText(boat.cap)
+        : bearingText(boat.field && boat.field.bearing);
       document.getElementById('latlon').textContent = (boat.lat !== null && boat.lon !== null)
         ? fmt(boat.lat, 7) + '  ' + fmt(boat.lon, 7)
         : '—';
       var age = state.age;
-      document.getElementById('age').textContent = state.mode === 'demo'
-        ? 'démo'
-        : ((age === null || age === undefined) ? '—' : fmt(age, 1) + ' s');
+      document.getElementById('age').textContent = estReplay
+        ? fmt(state.replay_t, 1) + ' s'
+        : (state.mode === 'demo'
+           ? 'démo'
+           : ((age === null || age === undefined) ? '—' : fmt(age, 1) + ' s'));
     } else {
       document.getElementById('dist').textContent = '—';
       document.getElementById('posX').textContent = '—';
@@ -1273,11 +1508,14 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     var lien = document.getElementById('autreLien');
     var dist = document.getElementById('autreDist');
     var a = state.autre;
-    if (!DATA.pilotage || !a) {
+    if ((!DATA.pilotage && !DATA.replay) || !a) {
       lien.textContent = '\u2014'; dist.textContent = '\u2014';
       return;
     }
-    if (a.lien === 'ok') {
+    if (DATA.replay && a.lien === 'ok') {
+      lien.textContent = 'hors ligne';
+      lien.style.color = COL.blue;
+    } else if (a.lien === 'ok') {
       lien.textContent = 'OK ' + fmt(a.age, 1) + ' s';
       lien.style.color = COL.green;
     } else if (a.lien === 'perdu') {
@@ -1300,8 +1538,364 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   var apercuTimer = null;
   var ETATS = { veille: 'en attente', demandee: 'demande envoyee', en_cours: 'EN COURS',
                 terminee: 'terminee', arretee: 'arretee', echec: 'echec' };
+  var RESULTATS = {
+    termine: 'terminé', terminee: 'terminée', arret_demande: 'arrêt demandé',
+    arretee: 'arrêtée', arret: 'arrêté', echec: 'échec', erreur: 'erreur',
+    parametres: 'paramètres refusés', pas_de_lien: 'pas de lien',
+    en_cours: 'en cours', sans_fin: 'sans fin', annulee: 'annulée'
+  };
 
   function el(id) { return document.getElementById(id); }
+
+  function valeurTexte(valeur) {
+    if (valeur === null || valeur === undefined) return '—';
+    if (typeof valeur === 'number') {
+      if (!isFinite(valeur)) return '—';
+      if (Math.abs(valeur - Math.round(valeur)) < 1e-9) {
+        return String(Math.round(valeur));
+      }
+      return String(Math.round(valeur * 1e6) / 1e6);
+    }
+    if (typeof valeur === 'boolean') return valeur ? 'oui' : 'non';
+    if (Array.isArray(valeur)) {
+      return valeur.map(valeurTexte).join(', ');
+    }
+    if (typeof valeur === 'object') {
+      try { return JSON.stringify(valeur); } catch (e) { return String(valeur); }
+    }
+    return String(valeur);
+  }
+
+  function ajouterLigne(zone, libelle, valeur) {
+    var label = document.createElement('span');
+    label.textContent = libelle;
+    var contenu = document.createElement('b');
+    contenu.textContent = valeur;
+    zone.appendChild(label);
+    zone.appendChild(contenu);
+  }
+
+  function etiquetteJournal(meta) {
+    var resultat = RESULTATS[meta.resultat] || meta.resultat || '?';
+    return (meta.mission || '?') + ' · ' + (meta.date_courte || '?') +
+      ' · ' + resultat + (meta.simulation ? ' · simulation' : '');
+  }
+
+  function autreProche(t) {
+    if (!replayAutres.length) return null;
+    var lo = 0, hi = replayAutres.length - 1;
+    while (lo < hi) {
+      var mid = Math.floor((lo + hi) / 2);
+      if (replayAutres[mid].t < t) lo = mid + 1;
+      else hi = mid;
+    }
+    var index = lo;
+    if (index > 0 && Math.abs(replayAutres[index - 1].t - t) <
+        Math.abs(replayAutres[index].t - t)) {
+      index -= 1;
+    }
+    var a = replayAutres[index];
+    return {
+      x: a.x, y: a.y, heading: a.heading || 0,
+      age: Math.abs(t - a.t), lien: 'ok'
+    };
+  }
+
+  function setReplayIndex(index) {
+    if (!replaySamples.length || !state) return;
+    replayIndex = clamp(index, 0, replaySamples.length - 1);
+    var s = replaySamples[replayIndex];
+    state.replay_t = s.t;
+    state.phase = s.phase;
+    state.cap = s.cap;
+    state.vitesse_sol = s.speed;
+    state.boat = {
+      x: s.x, y: s.y, lat: s.lat, lon: s.lon,
+      heading: s.heading || 0, speed: s.speed || 0,
+      heading_source: 'journal',
+      distance: Math.sqrt(Math.pow(s.x, 2) + Math.pow(s.y, 2)),
+      cap: s.cap, field: null
+    };
+    smooth = { x: s.x, y: s.y, h: s.heading || 0 };
+    state.age = 0;
+    state.stale = false;
+    state.autre = autreProche(s.t);
+    var curseur = el('replayTime');
+    if (curseur) curseur.value = String(replayIndex);
+    var temps = el('replayTemps');
+    if (temps) {
+      var texteTemps = fmt(s.t, 1) + ' s';
+      if (s.speed !== null && s.speed !== undefined) {
+        texteTemps += ' · ' + fmt(s.speed, 2) + ' m/s';
+      }
+      if (s.phase) texteTemps += ' · ' + s.phase;
+      temps.textContent = texteTemps;
+    }
+    updateDom();
+    drawInset();
+  }
+
+  function remplirPanneauReplay() {
+    el('replayVide').style.display = 'none';
+    el('replayEtat').textContent = replayMeta.mission || 'journal';
+    var stats = replay.stats || {};
+    var resume = el('replayResume');
+    resume.innerHTML = '';
+    ajouterLigne(resume, 'Mission', replayMeta.mission || '—');
+    ajouterLigne(resume, 'Date', replayMeta.date || '—');
+    ajouterLigne(resume, 'Durée', fmt(replayMeta.duree, 1) + ' s');
+    ajouterLigne(resume, 'Résultat',
+                 RESULTATS[replayMeta.resultat] || replayMeta.resultat || '—');
+    ajouterLigne(resume, 'Machine', (replayMeta.machine || '—') +
+                 (replayMeta.simulation ? ' · simulé' : ''));
+    if ((stats.nb_fixes || 0) > 0) {
+      ajouterLigne(resume, 'Trajet', fmt(stats.distance_parcourue, 1) + ' m');
+    }
+    if (stats.distance_autre !== null && stats.distance_autre !== undefined &&
+        stats.distance_autre > 0.05) {
+      ajouterLigne(resume, 'Trajet autre', fmt(stats.distance_autre, 1) + ' m');
+    }
+    if (stats.dist_min_autre !== null && stats.dist_min_autre !== undefined) {
+      ajouterLigne(resume, 'Autre min/max',
+                   fmt(stats.dist_min_autre, 1) + ' / ' +
+                   fmt(stats.dist_max_autre, 1) + ' m');
+    }
+    if (stats.vitesse_moyenne !== null && stats.vitesse_moyenne !== undefined) {
+      ajouterLigne(resume, 'Vitesse moy.',
+                   fmt(stats.vitesse_moyenne, 2) + ' m/s');
+    }
+    if (stats.vitesse_max !== null && stats.vitesse_max !== undefined) {
+      ajouterLigne(resume, 'Vitesse max',
+                   fmt(stats.vitesse_max, 2) + ' m/s');
+    }
+    if (stats.capture || stats.capture_manquee) {
+      var texteCapture = stats.capture_manquee ? 'manquée' : 'oui';
+      if (!stats.capture_manquee && stats.capture_dist_min !== null &&
+          stats.capture_dist_min !== undefined) {
+        texteCapture += ' · ' + fmt(stats.capture_dist_min, 2) + ' m';
+      }
+      ajouterLigne(resume, 'Capture', texteCapture);
+    }
+    if (stats.phase_finale) {
+      ajouterLigne(resume, 'Phase finale', stats.phase_finale);
+    }
+    if (stats.lien_perdu) {
+      ajouterLigne(resume, 'Liens perdus', String(stats.lien_perdu));
+    }
+    if (stats.arrets_urgence) {
+      ajouterLigne(resume, 'Arrêts urgence', String(stats.arrets_urgence));
+    }
+    ajouterLigne(resume, 'Journal',
+                 replayMeta.fichier + ' · ' +
+                 Math.round((replayMeta.taille || 0) / 1024) + ' Ko · ' +
+                 (replayMeta.lignes || 0) + ' lignes');
+
+    var parametres = el('replayParams');
+    parametres.innerHTML = '';
+    var params = replay.parametres || {};
+    var cles = Object.keys(params).sort();
+    if (!cles.length) {
+      ajouterLigne(parametres, 'Paramètres', '—');
+    } else {
+      cles.forEach(function (cle) {
+        ajouterLigne(parametres, cle, valeurTexte(params[cle]));
+      });
+    }
+
+    var configuration = el('replayConfig');
+    configuration.innerHTML = '';
+    var configData = replay.configuration || {};
+    var clesConfig = Object.keys(configData).sort();
+    if (!clesConfig.length) {
+      ajouterLigne(configuration, 'Configuration', '—');
+    } else {
+      clesConfig.forEach(function (cle) {
+        ajouterLigne(configuration, cle, valeurTexte(configData[cle]));
+      });
+    }
+
+    var bilan = el('replayBilan');
+    bilan.innerHTML = '';
+    var bilanData = replay.bilan || {};
+    var clesBilan = Object.keys(bilanData).sort();
+    if (!clesBilan.length) {
+      ajouterLigne(bilan, 'Bilan', '—');
+    } else {
+      clesBilan.forEach(function (cle) {
+        if (cle === 'type') return;
+        ajouterLigne(bilan, cle, valeurTexte(bilanData[cle]));
+      });
+    }
+
+    var evenements = el('replayEvents');
+    evenements.innerHTML = '';
+    var liste = replay.events || [];
+    if (!liste.length) {
+      evenements.textContent = 'Aucun événement particulier.';
+    } else {
+      liste.forEach(function (evenement) {
+        var ligne = document.createElement('div');
+        ligne.className = 'replay-event';
+        var temps = document.createElement('span');
+        temps.className = 'rt';
+        temps.textContent = (evenement.t === null || evenement.t === undefined)
+          ? '—' : fmt(evenement.t, 1) + 's';
+        var label = document.createElement('span');
+        label.className = 'rl';
+        label.textContent = ' ' + (evenement.label || evenement.type) + ' ';
+        var texte = document.createElement('span');
+        texte.textContent = evenement.texte || '';
+        ligne.appendChild(temps);
+        ligne.appendChild(label);
+        ligne.appendChild(texte);
+        evenements.appendChild(ligne);
+      });
+    }
+
+    el('replayLiens').style.display = 'flex';
+    el('replayJournal').href = '/journal?id=' +
+      encodeURIComponent(replayMeta.id || '');
+    el('replayKml').href = '/kml?id=' +
+      encodeURIComponent(replayMeta.id || '');
+
+    var timeline = el('replayTimeline');
+    if (replaySamples.length > 1) {
+      timeline.style.display = 'block';
+      var curseur = el('replayTime');
+      curseur.min = '0';
+      curseur.max = String(replaySamples.length - 1);
+      curseur.value = String(replaySamples.length - 1);
+      el('replayTempsDebut').textContent = fmt(replaySamples[0].t, 1) + ' s';
+      el('replayTempsFin').textContent = fmt(
+        replaySamples[replaySamples.length - 1].t, 1) + ' s';
+    } else {
+      timeline.style.display = 'none';
+    }
+  }
+
+  function afficherReplay(donnees) {
+    replay = donnees.replay || {};
+    replayMeta = donnees.meta || {};
+    replaySamples = replay.samples || [];
+    replayAutres = replay.autres || [];
+    replayIndex = Math.max(0, replaySamples.length - 1);
+    smooth = null;
+    var etat = donnees.state || {};
+    etat.mode = 'replay';
+    applyState(etat);
+    remplirPanneauReplay();
+    fitReplayBounds();
+    if (replaySamples.length) setReplayIndex(replayIndex);
+  }
+
+  function chargerJournal(ident) {
+    replayDemande += 1;
+    var demande = replayDemande;
+    el('replayEtat').textContent = 'lecture…';
+    fetch('/api/replay?id=' + encodeURIComponent(ident), { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (donnees) {
+        if (demande !== replayDemande) return;
+        afficherReplay(donnees);
+      })
+      .catch(function (erreur) {
+        if (demande !== replayDemande) return;
+        el('replayEtat').textContent = 'erreur';
+        el('replayVide').style.display = 'block';
+        el('replayVide').textContent = 'Impossible de lire ce journal : ' + erreur;
+      });
+  }
+
+  function remplirListeJournaux() {
+    var sel = el('replaySel');
+    sel.innerHTML = '';
+    if (!journalListe.length) {
+      el('replayVide').style.display = 'block';
+      el('replayEtat').textContent = 'vide';
+      el('replayResume').innerHTML = '';
+      el('replayParams').innerHTML = '';
+      el('replayConfig').innerHTML = '';
+      el('replayBilan').innerHTML = '';
+      el('replayEvents').innerHTML = '';
+      el('replayTimeline').style.display = 'none';
+      el('replayLiens').style.display = 'none';
+      return;
+    }
+    el('replayVide').style.display = 'none';
+    var groupes = {};
+    journalListe.forEach(function (meta, index) {
+      var groupe = groupes[meta.mission];
+      if (!groupe) {
+        groupe = document.createElement('optgroup');
+        groupe.label = meta.mission || '?';
+        groupes[meta.mission] = groupe;
+        sel.appendChild(groupe);
+      }
+      var option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = etiquetteJournal(meta);
+      groupe.appendChild(option);
+    });
+    var index = 0;
+    var voulu = '';
+    if (!replayMeta) {
+      try {
+        voulu = new URLSearchParams(window.location.search).get('journal') || '';
+      } catch (erreur) {
+        voulu = '';
+      }
+    }
+    if (voulu) {
+      for (var j = 0; j < journalListe.length; j++) {
+        if (journalListe[j].id === voulu) { index = j; break; }
+      }
+    } else if (replayMeta) {
+      for (var i = 0; i < journalListe.length; i++) {
+        if (journalListe[i].id === replayMeta.id) { index = i; break; }
+      }
+    }
+    sel.value = String(index);
+    chargerJournal(journalListe[index].id);
+  }
+
+  function chargerListeJournaux() {
+    fetch('/api/journaux', { cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function (liste) {
+        journalListe = liste || [];
+        remplirListeJournaux();
+      })
+      .catch(function (erreur) {
+        el('replayVide').style.display = 'block';
+        el('replayVide').textContent = 'Impossible de lire la liste des journaux : ' + erreur;
+        el('replayEtat').textContent = 'erreur';
+      });
+  }
+
+  function initReplay() {
+    if (!DATA.replay) return;
+    el('replayCard').style.display = 'block';
+    fetch('/api/points').then(function (r) { return r.json(); })
+      .then(function (liste) { namedPoints = liste; })
+      .catch(function () { namedPoints = []; });
+    el('replaySel').addEventListener('change', function (e) {
+      var meta = journalListe[parseInt(e.target.value, 10)];
+      if (meta) chargerJournal(meta.id);
+    });
+    el('replayRefresh').addEventListener('click', function () {
+      chargerListeJournaux();
+    });
+    el('replayTime').addEventListener('input', function (e) {
+      setReplayIndex(parseInt(e.target.value, 10));
+    });
+    chargerListeJournaux();
+  }
 
   function postJson(url, corps) {
     return fetch(url, {
@@ -1774,11 +2368,15 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
   });
   canvas.addEventListener('pointercancel', endPointer);
 
-  canvas.addEventListener('dblclick', function () { fitView(); });
+  canvas.addEventListener('dblclick', function () {
+    if (DATA.replay && replay) fitReplayBounds(); else fitView();
+  });
 
   document.getElementById('zoomIn').addEventListener('click', function () { zoomAt(1.4, W / 2, H / 2); });
   document.getElementById('zoomOut').addEventListener('click', function () { zoomAt(1 / 1.4, W / 2, H / 2); });
-  document.getElementById('resetView').addEventListener('click', function () { fitView(); });
+  document.getElementById('resetView').addEventListener('click', function () {
+    if (DATA.replay && replay) fitReplayBounds(); else fitView();
+  });
   document.getElementById('insetCard').addEventListener('click', function () { fitLake(); });
   document.getElementById('showField').addEventListener('change', function (e) {
     showField = e.target.checked; dirty = true;
@@ -1791,7 +2389,9 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     if (e.target && e.target.tagName === 'INPUT') return;
     if (e.key === '+' || e.key === '=') zoomAt(1.35, W / 2, H / 2);
     else if (e.key === '-') zoomAt(1 / 1.35, W / 2, H / 2);
-    else if (e.key === '0') fitView();
+    else if (e.key === '0') {
+      if (DATA.replay && replay) fitReplayBounds(); else fitView();
+    }
     else if (e.key === 'l' || e.key === 'L') fitLake();
     else if (e.key === 'f' || e.key === 'F') {
       var f = document.getElementById('showField');
@@ -1808,16 +2408,23 @@ PAGE_TEMPLATE = r"""<!DOCTYPE html>
     resizeTimer = setTimeout(resize, 100);
   });
 
-  document.getElementById('statusText').textContent = DATA.mode === 'live' ? 'TEMPS RÉEL' : 'SIMULATION';
-  if (DATA.mode === 'live') document.getElementById('statusPill').className = 'pill live';
+  document.getElementById('statusText').textContent =
+    DATA.mode === 'live' ? 'TEMPS RÉEL' :
+    (DATA.mode === 'replay' ? 'HORS LIGNE' : 'SIMULATION');
+  if (DATA.mode === 'live') {
+    document.getElementById('statusPill').className = 'pill live';
+  } else if (DATA.mode === 'replay') {
+    document.getElementById('statusPill').className = 'pill replay';
+  }
 
   initMissions();
   initComm();
+  initReplay();
   resize();
   requestAnimationFrame(render);
   tickClock();
   setInterval(tickClock, 1000);
-  poll();
+  if (DATA.mode !== 'replay') poll();
 })();
 </script>
 </body>
@@ -1919,6 +2526,933 @@ def local_vers_latlon(x, y, origine, rotation):
 
 def _arrondi(valeur, chiffres=3):
     return round(float(valeur), chiffres)
+
+
+def latlon_vers_local(lat, lon, origine, rotation):
+    """Convertit (lat, lon) dans le repere local de la base."""
+    lat0 = float(origine[0])
+    lon0 = float(origine[1])
+    dx = math.radians(lon - lon0) * R_TERRE * math.cos(math.radians(lat0))
+    dy = math.radians(lat - lat0) * R_TERRE
+    x = dx * math.cos(rotation) + dy * math.sin(rotation)
+    y = -dx * math.sin(rotation) + dy * math.cos(rotation)
+    return x, y
+
+
+class JournalStore(object):
+    """Index et lecture des journaux JSONL pour l'analyse hors ligne.
+
+    Les fichiers de ``logs/`` ne sont jamais modifies. La liste des journaux
+    est lue au demarrage et a chaque rafraichissement ; le contenu d'un
+    journal n'est analyse qu'au moment ou on le selectionne.
+    """
+
+    TYPES_EVENEMENTS = frozenset([
+        "phase", "depart", "points_auto", "polygone", "chemin", "point",
+        "segment", "stationkeeping", "capture", "capture_manquee",
+        "corde_tendue", "corde_retablie", "lien_perdu", "lien_retabli",
+        "arret_urgence", "reprise_urgence", "but_occupe", "but_occupe_fin",
+        "evitement_debut", "evitement_fin", "sommet_atteint", "point_fin",
+        "segment_fin", "fin_ralliement", "sortie_grande_zone", "pas_de_lien",
+        "arret_demande", "fin", "kml", "exception", "erreur_thread_materiel",
+        "erreur_communication", "gps_perime", "gps_retabli",
+    ])
+
+    CHAMPS_EVENEMENT = (
+        "phase", "message", "resultat", "issue", "erreur", "dist",
+        "dist_cible", "dist_autre", "dist_seg", "age_autre", "sommet",
+        "segment", "lateral_rms", "capture", "capture_dist_min",
+        "dist_min_autre", "dist_max_autre", "duree", "longueur_corde",
+    )
+
+    LIBELLES_EVENEMENTS = {
+        "phase": "Phase", "depart": "Depart", "points_auto": "Points auto",
+        "polygone": "Polygone", "chemin": "Chemin", "point": "Point",
+        "segment": "Segment", "stationkeeping": "Station keeping",
+        "capture": "Capture", "capture_manquee": "Capture manquee",
+        "corde_tendue": "Corde tendue", "corde_retablie": "Corde retablie",
+        "lien_perdu": "Lien perdu", "lien_retabli": "Lien retabli",
+        "arret_urgence": "Arret d'urgence", "reprise_urgence": "Reprise",
+        "but_occupe": "But occupe", "but_occupe_fin": "But libere",
+        "evitement_debut": "Evitement", "evitement_fin": "Fin evitement",
+        "sommet_atteint": "Sommet atteint", "point_fin": "Point atteint",
+        "segment_fin": "Segment fini", "fin_ralliement": "Ralliement fini",
+        "sortie_grande_zone": "Sortie de zone", "pas_de_lien": "Pas de lien",
+        "arret_demande": "Arret demande", "fin": "Fin", "kml": "KML",
+        "exception": "Exception", "erreur_thread_materiel": "Erreur materiel",
+        "erreur_communication": "Erreur communication",
+        "gps_perime": "GPS perime", "gps_retabli": "GPS retabli",
+    }
+
+    LIBELLES_CHAMPS = {
+        "phase": "phase", "message": "message", "resultat": "resultat",
+        "issue": "issue", "erreur": "erreur", "dist": "distance",
+        "dist_cible": "cible",
+        "dist_autre": "autre", "dist_seg": "segment", "age_autre": "age autre",
+        "sommet": "sommet", "segment": "segment", "lateral_rms": "ecart RMS",
+        "capture": "capture", "capture_dist_min": "capture min",
+        "dist_min_autre": "autre min", "dist_max_autre": "autre max",
+        "duree": "duree", "longueur_corde": "corde",
+    }
+
+    def __init__(self, racine):
+        self.racine = Path(racine)
+        self._meta_cache = {}
+        self._replay_cache = {}
+
+    @staticmethod
+    def _nombre(valeur):
+        try:
+            return float(valeur)
+        except (TypeError, ValueError):
+            return None
+
+    def _point_xy(self, valeur):
+        if isinstance(valeur, (list, tuple)) and len(valeur) >= 2:
+            x = self._nombre(valeur[0])
+            y = self._nombre(valeur[1])
+            if x is not None and y is not None:
+                return x, y
+        return None
+
+    def _date(self, chemin):
+        morceaux = chemin.stem.rsplit("_", 2)
+        if len(morceaux) == 3:
+            try:
+                date = datetime.strptime(morceaux[1] + morceaux[2],
+                                         "%Y%m%d%H%M%S")
+                return date.strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                pass
+        try:
+            return datetime.fromtimestamp(
+                chemin.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError):
+            return ""
+
+    def _fichiers(self):
+        if not self.racine.is_dir():
+            return []
+        try:
+            return sorted(p for p in self.racine.rglob("*.jsonl") if p.is_file())
+        except OSError:
+            return []
+
+    def _ident(self, chemin):
+        try:
+            return chemin.relative_to(self.racine).as_posix()
+        except ValueError:
+            return chemin.name
+
+    def _resoudre(self, ident):
+        if not ident:
+            return None
+        ident = str(ident).replace("\\", "/")
+        fichiers = self._fichiers()
+        for chemin in fichiers:
+            if self._ident(chemin) == ident:
+                return chemin
+        candidats = [p for p in fichiers if p.name == ident]
+        if len(candidats) == 1:
+            return candidats[0]
+        return None
+
+    def chemin(self, ident):
+        """Chemin d'un journal, ou None si l'identifiant est inconnu."""
+        return self._resoudre(ident)
+
+    def _meta(self, chemin):
+        try:
+            stat = chemin.stat()
+        except OSError:
+            return None
+        cle = (str(chemin), stat.st_mtime, stat.st_size)
+        if cle in self._meta_cache:
+            return self._meta_cache[cle]
+
+        configuration = {}
+        fin = None
+        bilan = {}
+        depart = None
+        capture = False
+        capture_manquee = False
+        lignes = 0
+        t_max = 0.0
+        try:
+            with chemin.open("r", encoding="utf-8", errors="replace") as fichier:
+                for ligne in fichier:
+                    ligne = ligne.strip()
+                    if not ligne:
+                        continue
+                    try:
+                        evenement = json.loads(ligne)
+                    except ValueError:
+                        continue
+                    if not isinstance(evenement, dict):
+                        continue
+                    lignes += 1
+                    t = self._nombre(evenement.get("t"))
+                    if t is not None:
+                        t_max = max(t_max, t)
+                    type_evenement = evenement.get("type")
+                    if type_evenement == "configuration" and not configuration:
+                        configuration = evenement
+                    elif type_evenement == "fin":
+                        fin = evenement
+                    elif type_evenement == "bilan":
+                        bilan = evenement
+                    elif type_evenement == "depart" and depart is None:
+                        depart = evenement
+                    elif type_evenement == "capture":
+                        capture = True
+                    elif type_evenement == "capture_manquee":
+                        capture_manquee = True
+        except OSError:
+            return None
+
+        nom = chemin.stem.rsplit("_", 2)[0]
+        mission = str(configuration.get("mission") or nom)
+        duree = None
+        if fin is not None:
+            duree = self._nombre(fin.get("duree"))
+        if duree is None:
+            duree = self._nombre(bilan.get("duree"))
+        if duree is None:
+            duree = t_max
+        resultat = ""
+        if fin is not None:
+            resultat = str(fin.get("resultat") or "")
+        elif bilan:
+            resultat = str(bilan.get("resultat") or "sans_fin")
+        else:
+            resultat = "en_cours"
+
+        date = self._date(chemin)
+        date_courte = date
+        if len(date) >= 16:
+            date_courte = "{}/{} {}".format(date[8:10], date[5:7],
+                                            date[11:16])
+        kml = chemin.with_suffix(".kml")
+        meta = {
+            "id": self._ident(chemin),
+            "fichier": chemin.name,
+            "mission": mission,
+            "date": date,
+            "date_courte": date_courte,
+            "duree": _arrondi(duree or 0.0, 3),
+            "resultat": resultat,
+            "machine": str(configuration.get("machine") or ""),
+            "simulation": bool(configuration.get("simulation")),
+            "taille": stat.st_size,
+            "lignes": lignes,
+            "capture": capture,
+            "capture_manquee": capture_manquee,
+            "parametres": configuration.get("parametres") or {},
+            "kml": kml.exists(),
+            "periode_envoi": configuration.get("periode_envoi"),
+            "cadence_gps_ms": configuration.get("cadence_gps_ms"),
+            "cadence_gps_confirmee": configuration.get("cadence_gps_confirmee"),
+            "commit": configuration.get("commit"),
+            "python": configuration.get("python"),
+        }
+        self._meta_cache[cle] = meta
+        return meta
+
+    def lister(self):
+        """Liste des journaux, du plus recent au plus ancien."""
+        metas = []
+        for chemin in self._fichiers():
+            meta = self._meta(chemin)
+            if meta is not None:
+                metas.append(meta)
+        # Les essais reels d'abord, du plus recent au plus ancien ; les
+        # journaux de simulation restent disponibles en fin de liste.
+        metas.sort(key=lambda m: (not m.get("simulation"),
+                                  m.get("date") or "", m.get("id") or ""),
+                   reverse=True)
+        return metas
+
+    def _texte_evenement(self, evenement):
+        type_evenement = evenement.get("type")
+        if type_evenement == "phase":
+            phase = str(evenement.get("phase") or "?")
+            message = evenement.get("message")
+            return "{} — {}".format(phase, message) if message else phase
+        if type_evenement in ("capture", "capture_manquee"):
+            morceaux = []
+            for cle, libelle in (("dist_seg", "segment"),
+                                 ("dist_autre", "autre")):
+                valeur = self._nombre(evenement.get(cle))
+                if valeur is not None:
+                    morceaux.append("{} à {:.2f} m".format(libelle, valeur))
+            age = self._nombre(evenement.get("age_autre"))
+            if age is not None:
+                morceaux.append("âge autre {:.2f} s".format(age))
+            return ", ".join(morceaux)
+        if type_evenement in ("lien_perdu", "lien_retabli"):
+            age = self._nombre(evenement.get("age_autre"))
+            return ("âge autre {:.2f} s".format(age)
+                    if age is not None else "")
+        if type_evenement in ("corde_tendue", "corde_retablie"):
+            morceaux = []
+            distance = self._nombre(evenement.get("dist_autre"))
+            if distance is not None:
+                morceaux.append("autre à {:.2f} m".format(distance))
+            corde = self._nombre(evenement.get("longueur_corde"))
+            if corde is not None:
+                morceaux.append("corde {:.1f} m".format(corde))
+            return ", ".join(morceaux)
+        if type_evenement == "fin":
+            resultat = evenement.get("resultat") or "?"
+            duree = self._nombre(evenement.get("duree"))
+            return ("{} ({:.1f} s)".format(resultat, duree)
+                    if duree is not None else str(resultat))
+        morceaux = []
+        for cle in self.CHAMPS_EVENEMENT:
+            if cle not in evenement:
+                continue
+            valeur = evenement.get(cle)
+            if valeur is None or valeur == "":
+                continue
+            if isinstance(valeur, float):
+                valeur = round(valeur, 2)
+            morceaux.append("{} {}".format(
+                self.LIBELLES_CHAMPS.get(cle, cle), valeur))
+        return ", ".join(morceaux)
+
+    def charger(self, ident):
+        """Analyse un journal et retourne l'etat de la carte et ses details."""
+        chemin = self._resoudre(ident)
+        if chemin is None:
+            return None
+        try:
+            stat = chemin.stat()
+        except OSError:
+            return None
+        cle = (str(chemin), stat.st_mtime, stat.st_size)
+        if cle in self._replay_cache:
+            return self._replay_cache[cle]
+        meta = self._meta(chemin)
+        if meta is None:
+            return None
+
+        configuration = {}
+        fin = None
+        bilan = {}
+        depart = None
+        polygone = None
+        chemin_prevu = None
+        point_evenement = None
+        station = None
+        points_auto = None
+        capture_evenement = None
+        segments = []
+        trace = []
+        trace_nav = []
+        trace_autre = []
+        autres = []
+        samples = []
+        samples_nav = []
+        evenements = []
+        dist_min_autre = None
+        dist_max_autre = None
+        nb_nav = 0
+        t_max = 0.0
+
+        with chemin.open("r", encoding="utf-8", errors="replace") as fichier:
+            for ligne in fichier:
+                ligne = ligne.strip()
+                if not ligne:
+                    continue
+                try:
+                    evenement = json.loads(ligne)
+                except ValueError:
+                    continue
+                if not isinstance(evenement, dict):
+                    continue
+                t = self._nombre(evenement.get("t"))
+                if t is not None:
+                    t_max = max(t_max, t)
+                type_evenement = evenement.get("type")
+
+                if type_evenement == "configuration" and not configuration:
+                    configuration = evenement
+                elif type_evenement == "fin":
+                    fin = evenement
+                elif type_evenement == "bilan":
+                    bilan = evenement
+                elif type_evenement == "depart" and depart is None:
+                    depart = evenement
+                elif type_evenement == "polygone" and polygone is None:
+                    polygone = evenement
+                elif type_evenement == "chemin" and chemin_prevu is None:
+                    chemin_prevu = evenement
+                elif type_evenement == "point" and point_evenement is None:
+                    point_evenement = evenement
+                elif type_evenement == "stationkeeping" and station is None:
+                    station = evenement
+                elif type_evenement == "points_auto" and points_auto is None:
+                    points_auto = evenement
+                elif type_evenement == "capture" and capture_evenement is None:
+                    capture_evenement = evenement
+                elif type_evenement == "segment":
+                    segments.append(evenement)
+
+                if type_evenement == "fix":
+                    x = self._nombre(evenement.get("x"))
+                    y = self._nombre(evenement.get("y"))
+                    if x is None or y is None:
+                        continue
+                    if (not trace or math.hypot(x - trace[-1][0],
+                                                y - trace[-1][1]) >= 0.2):
+                        trace.append([round(x, 2), round(y, 2)])
+                    cap = self._nombre(evenement.get("cap_moyen"))
+                    if cap is None:
+                        cap = self._nombre(evenement.get("cog"))
+                    heading = (math.radians(90.0 - cap)
+                               if cap is not None else 0.0)
+                    samples.append({
+                        "t": t if t is not None else t_max,
+                        "x": round(x, 2), "y": round(y, 2),
+                        "lat": self._nombre(evenement.get("lat")),
+                        "lon": self._nombre(evenement.get("lon")),
+                        "cap": cap, "heading": heading,
+                        "speed": self._nombre(evenement.get("v_sol")),
+                        "dist_base": self._nombre(evenement.get("dist_base")),
+                        "phase": evenement.get("phase"),
+                    })
+                elif type_evenement == "nav":
+                    x = self._nombre(evenement.get("x"))
+                    y = self._nombre(evenement.get("y"))
+                    if x is not None and y is not None:
+                        nb_nav += 1
+                        if (not trace_nav or math.hypot(
+                                x - trace_nav[-1][0],
+                                y - trace_nav[-1][1]) >= 0.35):
+                            trace_nav.append([round(x, 2), round(y, 2)])
+                        if (not samples_nav
+                                or (t if t is not None else t_max)
+                                - samples_nav[-1]["t"] >= 0.45):
+                            cap = self._nombre(evenement.get("cap"))
+                            samples_nav.append({
+                                "t": t if t is not None else t_max,
+                                "x": round(x, 2), "y": round(y, 2),
+                                "lat": None, "lon": None,
+                                "cap": cap,
+                                "heading": (math.radians(90.0 - cap)
+                                            if cap is not None else 0.0),
+                                "speed": self._nombre(evenement.get("v_sol")),
+                                "dist_base": None,
+                                "phase": evenement.get("phase"),
+                            })
+                    ax = self._nombre(evenement.get("autre_x"))
+                    ay = self._nombre(evenement.get("autre_y"))
+                    if ax is not None and ay is not None:
+                        if (not autres or math.hypot(
+                                ax - autres[-1]["x"],
+                                ay - autres[-1]["y"]) >= 0.5):
+                            cap_autre = self._nombre(evenement.get("autre_cap"))
+                            autres.append({
+                                "t": t if t is not None else t_max,
+                                "x": round(ax, 2), "y": round(ay, 2),
+                                "cap": cap_autre,
+                                "heading": (math.radians(90.0 - cap_autre)
+                                            if cap_autre is not None else 0.0),
+                                "age": self._nombre(
+                                    evenement.get("age_autre")),
+                            })
+                        distance = self._nombre(evenement.get("dist_autre"))
+                        if distance is not None:
+                            if dist_min_autre is None:
+                                dist_min_autre = distance
+                            else:
+                                dist_min_autre = min(dist_min_autre, distance)
+                            if dist_max_autre is None:
+                                dist_max_autre = distance
+                            else:
+                                dist_max_autre = max(dist_max_autre, distance)
+
+                if type_evenement in self.TYPES_EVENEMENTS:
+                    evenements.append(evenement)
+
+        if not trace:
+            trace = list(trace_nav)
+        if not samples:
+            samples = list(samples_nav)
+        if not trace and depart is not None:
+            xy = self._point_xy((depart.get("x"), depart.get("y")))
+            if xy is not None:
+                trace = [[round(xy[0], 2), round(xy[1], 2)]]
+        if not samples and trace:
+            samples = [{"t": 0.0, "x": trace[0][0], "y": trace[0][1],
+                        "lat": None, "lon": None, "cap": None,
+                        "heading": 0.0, "speed": None, "dist_base": None,
+                        "phase": None}]
+        if not trace_autre and depart is not None:
+            ax = self._nombre(depart.get("autre_x"))
+            ay = self._nombre(depart.get("autre_y"))
+            if ax is not None and ay is not None:
+                trace_autre.append([round(ax, 2), round(ay, 2)])
+                autres.append({"t": 0.0, "x": round(ax, 2),
+                               "y": round(ay, 2), "cap": None,
+                               "heading": 0.0, "age": None})
+        samples.sort(key=lambda s: s.get("t") or 0.0)
+        autres.sort(key=lambda a: a.get("t") or 0.0)
+        trace_autre = [[a["x"], a["y"]] for a in autres]
+
+        if len(trace) > 6000:
+            pas = int(math.ceil(len(trace) / 6000.0))
+            dernier = trace[-1]
+            trace = trace[::pas]
+            if trace[-1] != dernier:
+                trace.append(dernier)
+        if len(trace_autre) > 6000:
+            pas = int(math.ceil(len(trace_autre) / 6000.0))
+            dernier = trace_autre[-1]
+            trace_autre = trace_autre[::pas]
+            if trace_autre[-1] != dernier:
+                trace_autre.append(dernier)
+        if len(samples) > 4000:
+            pas = int(math.ceil(len(samples) / 4000.0))
+            dernier = samples[-1]
+            samples = samples[::pas]
+            if samples[-1] is not dernier:
+                samples.append(dernier)
+
+        home = configuration.get("home_latlong")
+        try:
+            rotation = float(configuration.get("rotation", 0.0))
+        except (TypeError, ValueError):
+            rotation = 0.0
+
+        def latlon_de_xy(x, y):
+            if not home or len(home) < 2:
+                return None, None
+            try:
+                lat, lon = local_vers_latlon(
+                    float(x), float(y),
+                    (float(home[0]), float(home[1])), rotation)
+                return lat, lon
+            except (TypeError, ValueError):
+                return None, None
+
+        for echantillon in samples:
+            if echantillon.get("lat") is None or echantillon.get("lon") is None:
+                lat, lon = latlon_de_xy(echantillon["x"], echantillon["y"])
+                echantillon["lat"] = lat
+                echantillon["lon"] = lon
+
+        boat = None
+        replay_t = 0.0
+        dernier = samples[-1] if samples else None
+        if dernier is not None:
+            replay_t = dernier.get("t") or 0.0
+            boat = {
+                "x": dernier["x"], "y": dernier["y"],
+                "lat": dernier.get("lat"), "lon": dernier.get("lon"),
+                "heading": dernier.get("heading") or 0.0,
+                "speed": dernier.get("speed") or 0.0,
+                "heading_source": "journal",
+                "distance": math.hypot(dernier["x"], dernier["y"]),
+                "cap": dernier.get("cap"),
+                "phase": dernier.get("phase"),
+                "field": None,
+            }
+
+        def point_xy(nom, role, xy=None, latlon=None, description=""):
+            lat = lon = None
+            if xy is None and latlon is not None:
+                lat, lon = latlon
+                if home and len(home) >= 2:
+                    try:
+                        xy = latlon_vers_local(
+                            float(lat), float(lon),
+                            (float(home[0]), float(home[1])), rotation)
+                    except (TypeError, ValueError):
+                        xy = None
+            if xy is None:
+                return None
+            x = self._nombre(xy[0])
+            y = self._nombre(xy[1])
+            if x is None or y is None:
+                return None
+            if lat is None or lon is None:
+                lat, lon = latlon_de_xy(x, y)
+            return {"nom": nom, "role": role, "x": round(x, 2),
+                    "y": round(y, 2), "lat": lat, "lon": lon,
+                    "description": description}
+
+        points = []
+        points_vus = set()
+
+        def ajouter_point(nom, role, xy=None, latlon=None, description=""):
+            point = point_xy(nom, role, xy=xy, latlon=latlon,
+                             description=description)
+            if point is None:
+                return None
+            cle_point = (point["nom"], round(point["x"], 1),
+                         round(point["y"], 1))
+            if cle_point not in points_vus:
+                points_vus.add(cle_point)
+                points.append(point)
+            return point
+
+        if depart is not None:
+            depart_ref = self._point_xy(depart.get("depart_ref"))
+            depart_xy = self._point_xy((depart.get("x"), depart.get("y")))
+            if depart_ref is not None:
+                ajouter_point("Depart", "depart", xy=depart_ref,
+                              description="depart choisi")
+            elif depart_xy is not None:
+                ajouter_point("Depart", "depart", xy=depart_xy,
+                              description="position au lancement")
+            for cle, nom, role, description in (
+                    ("centre", "Milieu", "centre", "milieu de la corde"),
+                    ("bouee", "Bouee", "bouee", "point a capturer"),
+                    ("arrivee", "Arrivee", "arrivee", "point d'arrivee"),
+                    ("p14", "p14", "formation", "bateau 14"),
+                    ("p18", "p18", "formation", "bateau 18")):
+                ajouter_point(nom, role, xy=self._point_xy(depart.get(cle)),
+                              description=description)
+        if points_auto is not None:
+            ajouter_point("Depart", "depart",
+                          xy=self._point_xy(points_auto.get("depart_ref")),
+                          description="depart choisi")
+            ajouter_point("Arrivee", "arrivee",
+                          xy=self._point_xy(points_auto.get("arrivee")),
+                          description="position de l'autre bateau")
+        if point_evenement is not None:
+            ajouter_point("Cible", "cible",
+                          xy=self._point_xy(point_evenement.get("cible")),
+                          description="point a rejoindre")
+        if station is not None:
+            ajouter_point("Cible", "cible",
+                          xy=self._point_xy(station.get("cible")),
+                          description="centre du station keeping")
+        if capture_evenement is not None:
+            ajouter_point("Capture", "capture",
+                          xy=self._point_xy((capture_evenement.get("centre_x"),
+                                             capture_evenement.get("centre_y"))),
+                          description="milieu de la corde a la capture")
+        if bilan:
+            if not any(p["role"] == "centre" for p in points):
+                ajouter_point("Milieu au depart", "centre",
+                              xy=self._point_xy(bilan.get("centre_depart")),
+                              description="milieu au lancement")
+            ajouter_point("Bouee", "bouee",
+                          xy=self._point_xy(bilan.get("bouee")),
+                          description="point a capturer")
+        if fin is not None:
+            ajouter_point("Fin", "fin",
+                          xy=self._point_xy((fin.get("x"), fin.get("y"))),
+                          description="position a la fin")
+
+        # Les points lus dans les evenements (coordonnees locales) sont plus
+        # precis que les lat/lon arrondis des parametres : on ne complete
+        # qu'en l'absence de point de meme role.
+        parametres = configuration.get("parametres") or {}
+        roles_presents = set(p["role"] for p in points)
+        for prefixe, nom, role, description in (
+                ("bouee", "Bouee", "bouee", "point a capturer"),
+                ("retour", "Retour", "retour", "point de retour"),
+                ("cible", "Cible", "cible", "point a rejoindre"),
+                ("depart", "Depart", "depart", "point de depart"),
+                ("arrivee", "Arrivee", "arrivee", "point d'arrivee")):
+            if role in roles_presents:
+                continue
+            lat = self._nombre(parametres.get(prefixe + "_lat"))
+            lon = self._nombre(parametres.get(prefixe + "_lon"))
+            if lat is not None and lon is not None:
+                ajouter_point(nom, role, latlon=(lat, lon),
+                              description=description)
+        if ("cible" not in roles_presents
+                and parametres.get("lat") is not None
+                and parametres.get("lon") is not None):
+            ajouter_point("Cible", "cible",
+                          latlon=(self._nombre(parametres.get("lat")),
+                                  self._nombre(parametres.get("lon"))),
+                          description="point de station keeping")
+
+        def ajouter_chemin(nom, points_bruts, ferme=False):
+            points_chemin = []
+            for brut in points_bruts or []:
+                xy = self._point_xy(brut)
+                if xy is not None:
+                    points_chemin.append([round(xy[0], 2),
+                                          round(xy[1], 2)])
+            if len(points_chemin) >= 2:
+                chemins.append({"nom": nom, "points": points_chemin,
+                                "ferme": bool(ferme)})
+
+        chemins = []
+        if chemin_prevu is not None:
+            ajouter_chemin("Chemin prevu", chemin_prevu.get("points"))
+        if polygone is not None:
+            ajouter_chemin("Polygone", polygone.get("sommets"),
+                           ferme=bool(polygone.get("ferme")))
+        if point_evenement is not None:
+            ajouter_chemin("Trajet", [point_evenement.get("a"),
+                                      point_evenement.get("cible")])
+        for indice, segment in enumerate(segments):
+            ajouter_chemin("Segment {}".format(indice + 1),
+                           [segment.get("a"), segment.get("b")])
+        if depart is not None:
+            ajouter_chemin("Corde au depart",
+                           [depart.get("p14"), depart.get("p18")])
+
+        cercles = []
+        for point in points:
+            rayon = None
+            if point["role"] == "bouee":
+                rayon = self._nombre(parametres.get("rayon_capture"))
+            elif point["role"] in ("retour", "cible", "arrivee"):
+                rayon = self._nombre(parametres.get("rayon_arrivee"))
+            if rayon is not None and rayon > 0:
+                cercles.append({"nom": point["nom"], "role": point["role"],
+                                "x": point["x"], "y": point["y"],
+                                "rayon": rayon})
+        if station is not None:
+            cible = self._point_xy(station.get("cible"))
+            if cible is not None:
+                for nom, cle in (("Grande zone", "rayon_grande"),
+                                 ("Petite zone", "rayon_petite")):
+                    rayon = self._nombre(station.get(cle))
+                    if rayon is not None and rayon > 0:
+                        cercles.append({"nom": nom, "role": "zone",
+                                        "x": round(cible[0], 2),
+                                        "y": round(cible[1], 2),
+                                        "rayon": rayon})
+
+        evenements_affiches = []
+        for evenement in evenements:
+            type_evenement = str(evenement.get("type") or "")
+            x = self._nombre(evenement.get("x"))
+            y = self._nombre(evenement.get("y"))
+            evenements_affiches.append({
+                "t": self._nombre(evenement.get("t")),
+                "type": type_evenement,
+                "label": self.LIBELLES_EVENEMENTS.get(
+                    type_evenement, type_evenement),
+                "texte": self._texte_evenement(evenement),
+                "x": x, "y": y,
+            })
+        evenements_affiches.sort(
+            key=lambda e: (e["t"] is None, e["t"] if e["t"] is not None else 0.0))
+
+        distance_trace = 0.0
+        for premier, second in zip(trace, trace[1:]):
+            distance_trace += math.hypot(second[0] - premier[0],
+                                         second[1] - premier[1])
+        distance_autre = 0.0
+        for premier, second in zip(trace_autre, trace_autre[1:]):
+            distance_autre += math.hypot(second[0] - premier[0],
+                                         second[1] - premier[1])
+        vitesses = [s.get("speed") for s in samples
+                    if s.get("speed") is not None]
+        duree = self._nombre(meta.get("duree")) or 0.0
+        stats = {
+            "distance_parcourue": round(distance_trace, 1),
+            "distance_autre": round(distance_autre, 1),
+            "vitesse_moyenne": (round(distance_trace / duree, 2)
+                                if duree > 0 else None),
+            "vitesse_max": (round(max(vitesses), 2) if vitesses else None),
+            "nb_fixes": len(samples),
+            "nb_nav": nb_nav,
+            "dist_min_autre": (round(self._nombre(bilan.get("dist_min_autre")),
+                                     2)
+                               if self._nombre(bilan.get("dist_min_autre"))
+                               is not None else
+                               (round(dist_min_autre, 2)
+                                if dist_min_autre is not None else None)),
+            "dist_max_autre": (round(self._nombre(bilan.get("dist_max_autre")),
+                                     2)
+                               if self._nombre(bilan.get("dist_max_autre"))
+                               is not None else
+                               (round(dist_max_autre, 2)
+                                if dist_max_autre is not None else None)),
+            "capture": bool(bilan.get("capture") or capture_evenement),
+            "capture_manquee": bool(bilan.get("capture_manquee")
+                                    or meta.get("capture_manquee")),
+            "capture_dist_min": self._nombre(bilan.get("capture_dist_min")),
+            "lien_perdu": sum(1 for e in evenements_affiches
+                              if e["type"] == "lien_perdu"),
+            "arrets_urgence": (bilan.get("arrets_urgence")
+                               if bilan.get("arrets_urgence") is not None
+                               else sum(1 for e in evenements_affiches
+                                        if e["type"] == "arret_urgence")),
+            "phase_finale": bilan.get("phase_finale"),
+            "duree": round(duree, 1),
+            "t_debut": samples[0]["t"] if samples else 0.0,
+            "t_fin": replay_t,
+        }
+
+        tous_les_points = ([[p["x"], p["y"]] for p in points]
+                           + trace + trace_autre)
+        for chemin_ in chemins:
+            tous_les_points.extend(chemin_["points"])
+        for cercle in cercles:
+            tous_les_points.append([cercle["x"] - cercle["rayon"],
+                                    cercle["y"] - cercle["rayon"]])
+            tous_les_points.append([cercle["x"] + cercle["rayon"],
+                                    cercle["y"] + cercle["rayon"]])
+        bounds = None
+        if tous_les_points:
+            bounds = {
+                "xmin": min(p[0] for p in tous_les_points),
+                "xmax": max(p[0] for p in tous_les_points),
+                "ymin": min(p[1] for p in tous_les_points),
+                "ymax": max(p[1] for p in tous_les_points),
+            }
+
+        autre_final = None
+        if autres:
+            a = autres[-1]
+            autre_final = {
+                "x": a["x"], "y": a["y"],
+                "heading": a["heading"], "age": 0.0, "lien": "ok",
+            }
+        etat_mission = "terminee"
+        if fin is None:
+            etat_mission = "en_cours"
+        elif meta["resultat"] in ("arret_demande", "arretee"):
+            etat_mission = "arretee"
+        elif meta["resultat"] in ("erreur", "echec"):
+            etat_mission = "echec"
+
+        state = {
+            "mode": "replay",
+            "boat": boat,
+            "trail": trace,
+            "trail_autre": trace_autre,
+            "autre": autre_final,
+            "stale": False,
+            "age": 0.0,
+            "replay_t": replay_t,
+            "notice": "{} · {} · {}".format(
+                meta["mission"], meta["date"], meta["resultat"]),
+            "mission": {
+                "etat": etat_mission,
+                "resultat": meta["resultat"],
+                "duree": duree,
+            },
+            "phase": dernier.get("phase") if dernier else None,
+            "cap": dernier.get("cap") if dernier else None,
+            "vitesse_sol": dernier.get("speed") if dernier else None,
+        }
+
+        configuration_resume = {}
+        for cle_config in ("home_latlong", "rotation", "regulateur", "derive",
+                           "commit", "python", "machine", "simulation",
+                           "periode_envoi", "cadence_gps_ms",
+                           "cadence_gps_confirmee"):
+            if cle_config in configuration:
+                configuration_resume[cle_config] = configuration[cle_config]
+
+        replay = {
+            "samples": samples,
+            "autres": autres,
+            "points": points,
+            "paths": chemins,
+            "cercles": cercles,
+            "events": evenements_affiches,
+            "stats": stats,
+            "parametres": parametres,
+            "bilan": bilan,
+            "configuration": configuration_resume,
+            "bounds": bounds,
+        }
+        resultat = {"meta": meta, "state": state, "replay": replay}
+        self._replay_cache[cle] = resultat
+        return resultat
+
+    def _kml_track(self, nom, coordonnees, style):
+        if not coordonnees or len(coordonnees) < 2:
+            return []
+        lignes = [
+            "<Placemark>",
+            "<name>{}</name>".format(xml_escape(nom)),
+            "<styleUrl>#{}</styleUrl>".format(style),
+            "<LineString><tessellate>1</tessellate><coordinates>",
+        ]
+        lignes.append(" ".join(
+            "{:.7f},{:.7f},0".format(lon, lat)
+            for lat, lon in coordonnees))
+        lignes.extend(["</coordinates></LineString>", "</Placemark>"])
+        return lignes
+
+    def kml(self, ident):
+        """Retourne (nom, contenu) du KML, existant ou genere depuis le journal."""
+        chemin = self._resoudre(ident)
+        if chemin is None:
+            return None
+        cote = chemin.with_suffix(".kml")
+        if cote.exists():
+            try:
+                return cote.name, cote.read_bytes()
+            except OSError:
+                pass
+        donnees = self.charger(ident)
+        if donnees is None:
+            return None
+        meta = donnees["meta"]
+        replay = donnees["replay"]
+        configuration = replay.get("configuration") or {}
+        home = configuration.get("home_latlong")
+        try:
+            rotation = float(configuration.get("rotation", 0.0))
+        except (TypeError, ValueError):
+            rotation = 0.0
+
+        def coordonnees_trace(points):
+            resultat = []
+            for point in points:
+                lat = self._nombre(point.get("lat"))
+                lon = self._nombre(point.get("lon"))
+                if (lat is None or lon is None) and home and len(home) >= 2:
+                    try:
+                        lat, lon = local_vers_latlon(
+                            float(point["x"]), float(point["y"]),
+                            (float(home[0]), float(home[1])), rotation)
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                if lat is not None and lon is not None:
+                    resultat.append((lat, lon))
+            return resultat
+
+        lignes = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<kml xmlns="http://www.opengis.net/kml/2.2">',
+            '<Document>',
+            '<name>{}</name>'.format(xml_escape(
+                "{} {}".format(meta["mission"], meta["date"]))),
+            '<Style id="bateau"><LineStyle><color>ff2f55d4</color>'
+            '<width>3</width></LineStyle></Style>',
+            '<Style id="autre"><LineStyle><color>ffa04f6b</color>'
+            '<width>2</width></LineStyle></Style>',
+        ]
+        lignes.extend(self._kml_track(
+            "Bateau", coordonnees_trace(replay.get("samples") or []), "bateau"))
+        lignes.extend(self._kml_track(
+            "Autre bateau", coordonnees_trace(replay.get("autres") or []),
+            "autre"))
+        for point in replay.get("points") or []:
+            lat = self._nombre(point.get("lat"))
+            lon = self._nombre(point.get("lon"))
+            if lat is None or lon is None:
+                continue
+            description = point.get("description") or ""
+            lignes.extend([
+                "<Placemark>",
+                "<name>{}</name>".format(xml_escape(str(point.get("nom")))),
+                "<description>{}</description>".format(
+                    xml_escape(str(description))),
+                "<Point><coordinates>{:.7f},{:.7f},0</coordinates></Point>"
+                .format(lon, lat),
+                "</Placemark>",
+            ])
+        lignes.extend(["</Document>", "</kml>"])
+        corps = "\n".join(lignes).encode("utf-8")
+        return chemin.stem + ".kml", corps
 
 
 def construire_statique(env):
@@ -2378,6 +3912,7 @@ class Handler(BaseHTTPRequestHandler):
     app_state = None
     session = None
     env = None
+    replay_store = None
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -2386,14 +3921,38 @@ class Handler(BaseHTTPRequestHandler):
             self._envoyer(200, "text/html; charset=utf-8", self.page)
         elif route == "/api/state":
             try:
-                corps = json.dumps(self.app_state.snapshot(),
-                                   ensure_ascii=False,
+                if self.app_state is None:
+                    etat = {
+                        "mode": "replay", "boat": None, "trail": [],
+                        "trail_autre": [], "stale": True,
+                        "notice": "Choisir un journal dans le panneau Journaux",
+                    }
+                else:
+                    etat = self.app_state.snapshot()
+                corps = json.dumps(etat, ensure_ascii=False,
                                    separators=(",", ":")).encode("utf-8")
             except Exception as exc:
                 corps = json.dumps({"error": str(exc)}).encode("utf-8")
                 self._envoyer(500, "application/json; charset=utf-8", corps)
                 return
             self._envoyer(200, "application/json; charset=utf-8", corps)
+        elif route == "/api/journaux":
+            if self.replay_store is None:
+                self._envoyer_json(200, [])
+            else:
+                self._envoyer_json(200, self.replay_store.lister())
+        elif route == "/api/replay":
+            if self.replay_store is None:
+                self._envoyer_json(404, {"error": "mode hors ligne indisponible"})
+                return
+            demande = {cle: valeurs[0] for cle, valeurs in parse_qs(
+                url.query, keep_blank_values=True).items()}
+            ident = demande.get("id", "")
+            donnees = self.replay_store.charger(ident)
+            if donnees is None:
+                self._envoyer_json(404, {"error": "journal inconnu"})
+                return
+            self._envoyer_json(200, donnees)
         elif route == "/api/missions":
             liste = self.session.description_missions() if self.session else []
             self._envoyer_json(200, liste)
@@ -2406,15 +3965,25 @@ class Handler(BaseHTTPRequestHandler):
                 url.query, keep_blank_values=True).items()}
             nom = demande.pop("nom", "")
             self._envoyer_json(200, {"points": self.session.apercu(nom, demande)})
-        elif route == "/journal" and self.session is not None \
-                and self.session.chemin_journal_courant() is not None:
-            # Journal de la derniere mission, telechargeable depuis le PC.
-            chemin = self.session.chemin_journal_courant()
+        elif route == "/journal":
+            chemin = None
+            demande = {cle: valeurs[0] for cle, valeurs in parse_qs(
+                url.query, keep_blank_values=True).items()}
+            ident = demande.get("id", "")
+            if ident and self.replay_store is not None:
+                chemin = self.replay_store.chemin(ident)
+            elif self.session is not None:
+                chemin = self.session.chemin_journal_courant()
+            if chemin is None:
+                self._envoyer(404, "text/plain; charset=utf-8",
+                              b"journal inconnu")
+                return
             try:
                 with open(str(chemin), "rb") as fichier:
                     corps = fichier.read()
             except OSError as exc:
-                self._envoyer(404, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
+                self._envoyer(404, "text/plain; charset=utf-8",
+                              str(exc).encode("utf-8"))
                 return
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -2427,20 +3996,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(corps)
             except (BrokenPipeError, ConnectionResetError):
                 pass
-        elif route == "/kml" and self.session is not None \
-                and self.session.chemin_kml_courant() is not None:
-            chemin = self.session.chemin_kml_courant()
-            try:
-                with open(str(chemin), "rb") as fichier:
-                    corps = fichier.read()
-            except OSError as exc:
-                self._envoyer(404, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
+        elif route == "/kml":
+            nom = None
+            corps = None
+            demande = {cle: valeurs[0] for cle, valeurs in parse_qs(
+                url.query, keep_blank_values=True).items()}
+            ident = demande.get("id", "")
+            if ident and self.replay_store is not None:
+                resultat = self.replay_store.kml(ident)
+                if resultat is not None:
+                    nom, corps = resultat
+            elif self.session is not None:
+                chemin = self.session.chemin_kml_courant()
+                if chemin is not None:
+                    try:
+                        with open(str(chemin), "rb") as fichier:
+                            corps = fichier.read()
+                        nom = chemin.name
+                    except OSError as exc:
+                        self._envoyer(404, "text/plain; charset=utf-8",
+                                      str(exc).encode("utf-8"))
+                        return
+            if corps is None or nom is None:
+                self._envoyer(404, "text/plain; charset=utf-8",
+                              b"kml inconnu")
                 return
             self.send_response(200)
             self.send_header("Content-Type",
                              "application/vnd.google-earth.kml+xml; charset=utf-8")
             self.send_header("Content-Disposition",
-                             'attachment; filename="{}"'.format(chemin.name))
+                             'attachment; filename="{}"'.format(nom))
             self.send_header("Content-Length", str(len(corps)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -2528,8 +4113,8 @@ def adresse_locale():
 
 def parser_arguments(argv=None):
     parser = argparse.ArgumentParser(
-        description="IHM du Lac de Guerledan : visualisation, essais de reglage "
-                    "et missions du bateau.")
+        description="IHM du Lac de Guerledan : analyse hors ligne des journaux, "
+                    "visualisation, essais de reglage et missions du bateau.")
     parser.add_argument("--bateau", action="store_true",
                         help="ouvrir le materiel (Arduino, GPS, compas) et lancer "
                              "les essais et missions depuis l'IHM")
@@ -2550,6 +4135,14 @@ def parser_arguments(argv=None):
                         help="simulation : position (m) et cap (deg) de depart")
     parser.add_argument("--live", action="store_true",
                         help="lire la position GPS reelle au lieu de la simulation")
+    parser.add_argument("--replay", action="store_true",
+                        help="analyser hors ligne les journaux JSONL de logs/ "
+                             "sans ouvrir le materiel")
+    parser.add_argument("--demo", action="store_true",
+                        help="forcer la simulation quand des journaux existent")
+    parser.add_argument("--logs", default=None, metavar="DOSSIER",
+                        help="dossier des journaux pour --replay "
+                             "(defaut : logs du projet)")
     parser.add_argument("--gps", type=int, choices=(0, 1, 2), default=0,
                         help="peripherique GPS : /dev/ttyGPS0, 1 ou 2 (defaut : 0)")
     parser.add_argument("--attente", type=float, default=None,
@@ -2569,12 +4162,34 @@ def parser_arguments(argv=None):
     args.pilotage = args.bateau or args.mission is not None
     if args.simulation and not args.pilotage:
         parser.error("--simulation s'utilise avec --bateau ou --mission")
+    if args.replay and (args.pilotage or args.live):
+        parser.error("--replay ne s'utilise pas avec --bateau, --mission ou --live")
+    if args.demo and (args.pilotage or args.live or args.replay
+                      or args.logs is not None):
+        parser.error("--demo ne s'utilise pas avec --bateau, --mission, "
+                     "--live, --replay ou --logs")
     if args.host is None:
         args.host = "0.0.0.0" if args.pilotage and not args.simulation else "127.0.0.1"
     if args.pilotage and not args.simulation:
         # Sur le bateau, il n'y a pas de navigateur a ouvrir.
         args.no_browser = True
     return args
+
+
+def dossier_logs(args):
+    """Dossier des journaux analyse en mode hors ligne."""
+    if args.logs:
+        return Path(args.logs).expanduser()
+    return BASE_DIR / "logs"
+
+
+def dossier_contient_journaux(dossier):
+    try:
+        for _chemin in Path(dossier).rglob("*.jsonl"):
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def parametres_simulation(args):
@@ -2621,6 +4236,7 @@ def main(argv=None):
     notice = "Simulation : trajectoire le long du gradient"
     bateau = None
     session = None
+    replay_store = None
     demande = None
 
     if args.pilotage:
@@ -2666,13 +4282,22 @@ def main(argv=None):
             print("Repli sur la simulation.")
             notice = "GPS indisponible — simulation"
 
-    if bateau is None:
+    if not args.pilotage and not args.live:
+        dossier = dossier_logs(args)
+        if (args.replay or args.logs is not None
+                or (not args.demo and dossier_contient_journaux(dossier))):
+            replay_store = JournalStore(dossier)
+            mode = "replay"
+            notice = "Journaux hors ligne : choisir une mission"
+
+    if bateau is None and replay_store is None:
         bateau = DemoBoat(env)
 
-    app_state = AppState(env, bateau, mode, notice)
+    app_state = AppState(env, bateau, mode, notice) if bateau else None
     static = construire_statique(env)
     static["mode"] = mode
     static["pilotage"] = session is not None
+    static["replay"] = replay_store is not None
     static_json = json.dumps(static, ensure_ascii=False, separators=(",", ":"))
     page = PAGE_TEMPLATE.replace("__STATIC_JSON__", static_json)
 
@@ -2680,6 +4305,7 @@ def main(argv=None):
     Handler.app_state = app_state
     Handler.session = session
     Handler.env = env
+    Handler.replay_store = replay_store
 
     try:
         serveur = Serveur((args.host, args.port), Handler)
@@ -2687,7 +4313,8 @@ def main(argv=None):
         print("Impossible d'ouvrir le port {} : {}".format(args.port, exc))
         if session is not None:
             session.fermer_materiel()
-        bateau.close()
+        if bateau is not None:
+            bateau.close()
         return 1
 
     hote = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
@@ -2705,6 +4332,9 @@ def main(argv=None):
     if session is not None:
         print("Mode : {}".format("bateau simule" if args.simulation else "bateau"))
         print("Essais et missions : depuis la page de l'IHM (panneau Missions).")
+    elif replay_store is not None:
+        print("Mode : journaux hors ligne ({})".format(replay_store.racine))
+        print("Choisir une mission dans le panneau Journaux.")
     else:
         print("Mode : {}".format("GPS temps reel" if mode == "live" else "simulation"))
     print("Ctrl+C pour arreter.")
@@ -2738,10 +4368,11 @@ def main(argv=None):
             serveur.shutdown()
             session.fermer_materiel()
         serveur.server_close()
-        try:
-            bateau.close()
-        except Exception:
-            pass
+        if bateau is not None:
+            try:
+                bateau.close()
+            except Exception:
+                pass
     return code
 
 
